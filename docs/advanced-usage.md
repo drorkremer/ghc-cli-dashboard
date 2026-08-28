@@ -12,7 +12,10 @@ Exports and generated dashboards can contain personal and confidential data:
 
 - The default user label is the operating-system username.
 - Project names, model names, dates, and session IDs are retained.
-- `--include-task-summary` adds free-text task summaries.
+- Free-text task summaries are included by default (this tool is meant for
+  personal viewing); pass `--exclude-task-summary` to `extract_usage.py` to
+  leave them out, or `--omit-task-summaries` to `dashboard.py` to strip them
+  at build time before sharing.
 - A dashboard embeds its source rows in the HTML file.
 
 Treat a CSV or generated dashboard as sensitive data. Review it before

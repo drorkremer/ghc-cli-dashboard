@@ -1881,7 +1881,7 @@ function render() {{
   if (patternsNote) {{
     patternsNote.innerHTML = taskData.length
       ? "Themes are inferred from task-summary keywords; unclassified summaries appear as <b>Other</b>. Use this as a workflow signal, not a productivity score."
-      : "No task summaries are available. Re-run <code>extract_usage.py --include-task-summary</code> to populate Work patterns.";
+      : "No task summaries are available. Re-run <code>extract_usage.py</code> without <code>--exclude-task-summary</code> (and without <code>--omit-task-summaries</code> at build time) to populate Work patterns.";
   }}
 
   const themeTimeMap = new Map();

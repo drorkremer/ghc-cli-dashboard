@@ -30,8 +30,10 @@ python dashboard.py --in "copilot_usage_*.csv" --out usage_dashboard.html
 
 Open `usage_dashboard.html` in a browser.
 
-Task summaries are excluded by default. Add `--include-task-summary` only if
-you need the Work patterns view and have reviewed the privacy implications.
+Task summaries are included by default, since this tool is meant for
+personal viewing and the Work patterns view relies on them. Pass
+`--exclude-task-summary` to `extract_usage.py` if you'd rather leave them
+out, and review the privacy implications before sharing a CSV or dashboard.
 
 ## What it shows
 
