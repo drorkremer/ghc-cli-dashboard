@@ -283,7 +283,9 @@ def main():
     ap.add_argument("--db", default=default_db_path(), help="Path to session-store.db (default: ~/.copilot/session-store.db)")
     ap.add_argument("--out", default=None, help="Output CSV path (default: ./copilot_usage_<user>_<date>.csv)")
     ap.add_argument("--user-label", default=None, help="Label to identify you in a shared/team rollup (default: OS username)")
-    ap.add_argument("--exclude-task-summary", action="store_true", help="Exclude the free-text session/task summary (included by default - may contain sensitive detail; pass this before sharing the CSV)")
+    summary_options = ap.add_mutually_exclusive_group()
+    summary_options.add_argument("--exclude-task-summary", action="store_true", help="Exclude the free-text session/task summary (included by default - may contain sensitive detail; pass this before sharing the CSV)")
+    summary_options.add_argument("--include-task-summary", action="store_true", help="Include free-text task summaries (the default; retained for existing commands)")
     args = ap.parse_args()
 
     user_label = args.user_label or getpass.getuser()
