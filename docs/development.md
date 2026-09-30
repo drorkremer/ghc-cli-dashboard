@@ -13,6 +13,19 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
+Optional topic discovery requires `python -m pip install -r requirements-topics.txt`;
+the model weights download on first use. Topic tests inject a deterministic
+encoder, so the normal test suite does not download a model or require the
+optional package. For a real local smoke check, build a topic-enabled
+dashboard from synthetic CSV data and inspect the localhost editor.
+
+Optional local SLM summaries require `python -m pip install -r
+requirements-summaries.txt` and a downloaded Qwen2.5 GGUF file. The
+summarizer tests inject a deterministic generator, so CI does not download
+weights or require GPT4All. The Windows x64 wheel is published, but a real
+Windows inference smoke test is still needed before claiming full platform
+validation.
+
 The GitHub Actions workflow runs the test suite on Python 3.9 with Node.js.
 Node executes the lightweight DOM harness used for generated-dashboard tests.
 The harness also accepts a fourth argument containing a JSON array of named

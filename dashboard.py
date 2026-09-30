@@ -39,6 +39,7 @@ from plotly.colors import qualitative
 from plotly.offline import get_plotlyjs
 
 from provider_classifier import PROVIDER_COLORS, classify_provider
+from topic_classifier import OTHER, classify, session_key
 
 # Columns every input CSV must have for a record to be constructed at all -
 # these are read unconditionally (no getattr/default) in build_dashboard().
@@ -734,7 +735,12 @@ def _nullable_int(value):
 def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
                      exclude_default_projects: list, exclude_default_models: list,
                      storage_key: str, exclude_projects: list = None,
-                     omit_task_summaries: bool = False):
+                     omit_task_summaries: bool = False, topic_file=None):
+    if topic_file and omit_task_summaries:
+        raise ValueError(
+            "Topic classification cannot be combined with --omit-task-summaries: "
+            "discovered topic names can disclose information from summaries."
+        )
     data, exclude_default_projects = _redact_projects(data, exclude_projects or [], exclude_default_projects)
 
     if omit_task_summaries and "task_summary" in data.columns:
@@ -747,6 +753,19 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
 
     has_tasks = "task_summary" in data.columns
     has_effort = "reasoning_effort" in data.columns
+    topic_assignments = {}
+    topic_catalog = None
+    if topic_file:
+        sessions = {}
+        for row in data.itertuples():
+            sid = getattr(row, "session_id", None)
+            if isinstance(sid, str) and sid:
+                key = session_key(str(row.user), sid)
+                summary = getattr(row, "topic_summary", None)
+                if not isinstance(summary, str) or not summary.strip():
+                    summary = getattr(row, "task_summary", None)
+                sessions.setdefault(key, (str(row.user), sid, summary))
+        topic_assignments, topic_catalog = classify(sessions.values(), topic_file)
 
     records = []
     for r in data.itertuples():
@@ -780,6 +799,12 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
             "session_id": getattr(r, "session_id", None),
             "reasoning_effort": getattr(r, "reasoning_effort", "n/a") or "n/a" if has_effort else "n/a",
         }
+        if topic_file:
+            sid = rec["session_id"]
+            rec["topic_id"] = (
+                topic_assignments.get(session_key(str(r.user), sid), OTHER)
+                if isinstance(sid, str) and sid else OTHER
+            )
         if has_tasks:
             rec["task_summary"] = getattr(r, "task_summary", "") or ""
         records.append(rec)
@@ -805,6 +830,16 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     # All of these are embedded verbatim inside a <script> block below, so they
     # go through _json_for_script (not plain json.dumps) - see its docstring.
     raw_json = _json_for_script(records)
+    used_topic_ids = {rec["topic_id"] for rec in records} if topic_file else set()
+    topic_catalog_json = _json_for_script({
+        "topics": [
+            {"id": topic["id"], "name": topic["name"], "kind": topic["kind"]}
+            for topic in (topic_catalog["topics"] if topic_catalog else [])
+            if topic["id"] in used_topic_ids
+        ],
+        "assignments": {}, "overrides": {},
+    })
+    topics_enabled_json = str(bool(topic_file)).lower()
     project_order_json = _json_for_script(project_order)
     model_order_json = _json_for_script(model_order)
     model_mix_colors_json = _json_for_script(_model_mix_colors(model_order))
@@ -825,10 +860,63 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     storage_key_datefilter_json = _json_for_script(f"copilot_usage_datefilter::{storage_key}")
     storage_key_trend_json = _json_for_script(f"copilot_usage_trend_granularity::{storage_key}")
     storage_key_sidebar_json = _json_for_script(f"copilot_usage_sidebar_collapsed::{storage_key}")
+    storage_key_topic_json = _json_for_script(f"copilot_usage_topic::{storage_key}")
 
     project_checkbox_items = _checkbox_items(project_order, projects_by_tokens, "proj-check")
     model_checkbox_items = _checkbox_items(model_order, models_by_tokens, "model-check")
     provider_checkbox_items = _checkbox_items(provider_order, providers_by_tokens, "provider-check")
+    topic_nav_html = '<a href="#sec-topics">Topics</a>' if topic_file else ""
+    topic_filter_html = (
+        '<div class="side-panel" id="topic-panel"><h2>Topics</h2>'
+        '<label for="topic-filter" class="hint">Filter by topic</label>'
+        '<select id="topic-filter" class="topic-filter" onchange="setTopicFilter(this.value)" '
+        'aria-label="Filter by topic"></select></div>'
+        if topic_file else ""
+    )
+    topic_section_html = """
+      <div class="section" id="sec-topics">
+        <div class="section-head"><h2>Topics</h2></div>
+        <p class="section-desc">Offline, session-level topic suggestions. Costs use the existing
+          nano-AIU figure; sessions are counted once even when multiple models or days are selected.
+          Correct suggestions in editable localhost mode.</p>
+        <div class="card"><div id="fig_topic" style="height:360px;"></div></div>
+        <div class="card" style="margin-top:14px;overflow-x:auto;">
+          <table><thead><tr><th>Topic</th><th>Sessions</th><th>Tokens</th>
+          <th>Est. cost</th></tr></thead><tbody id="topic-table"></tbody></table>
+        </div>
+        <div class="card" id="topic-editor" hidden style="margin-top:14px;">
+          <h2>Manage topics</h2>
+          <p class="hint">Changes are saved to your local topic file. Session corrections
+          override automatic suggestions on future builds.</p>
+          <div id="topic-status" role="status"></div>
+          <label>New topic name <input id="topic-new-name" maxlength="120"></label>
+          <label>Example summary (optional) <input id="topic-new-example" maxlength="500"></label>
+          <button class="table-action" onclick="createTopic()">Create topic</button>
+          <div style="margin-top:12px;">
+            <label>Topic <select id="topic-rename-id"></select></label>
+            <label>New name <input id="topic-rename-name" maxlength="120"></label>
+            <button class="table-action" onclick="renameTopic()">Rename</button>
+          </div>
+          <div style="margin-top:12px;">
+            <label>Matching rules <select id="topic-edit-id" onchange="populateTopicRules()"></select></label>
+            <label>Example summaries (one per line)
+              <textarea id="topic-edit-examples" rows="3"></textarea></label>
+            <label>Exact phrases (one per line)
+              <textarea id="topic-edit-keywords" rows="3"></textarea></label>
+            <button class="table-action" onclick="updateTopicRules()">Save matching rules</button>
+          </div>
+          <div style="margin-top:12px;">
+            <label>Merge <select id="topic-merge-source"></select></label>
+            <label>into <select id="topic-merge-target"></select></label>
+            <button class="table-action" onclick="mergeTopic()">Merge</button>
+          </div>
+          <h3>Session corrections</h3>
+          <div style="overflow-x:auto;"><table><thead><tr><th>Session</th>
+          <th>Task</th><th>Topic</th></tr></thead>
+          <tbody id="topic-session-table"></tbody></table></div>
+        </div>
+      </div>
+    """ if topic_file else ""
 
     plotly_js = get_plotlyjs()
     title_html = _esc(title)
@@ -918,6 +1006,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
   .filter-controls {{ display: flex; gap: 12px; align-items: center; margin-top: 10px; flex-wrap: wrap; }}
   .filter-summary {{ flex: 1; min-width: 150px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }}
   .filter-search {{ display: block; width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 6px; font: inherit; font-size: 14px; }}
+  .topic-filter {{ display: block; width: 100%; padding: 8px; margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: white; }}
   .filter-item {{ display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }}
   .filter-item[hidden], [hidden] {{ display: none !important; }}
   .filter-item .proj-item {{ flex: 1; min-width: 0; }}
@@ -1044,6 +1133,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     <p class="subtitle"><span id="data-freshness"></span> &middot; Generated {datetime.now():%Y-%m-%d %H:%M} &middot; Local session-store exports</p>
     <div class="nav-pills">
       <a href="#sec-overview">Overview</a>
+      {topic_nav_html}
       <a href="#sec-trends">Trends</a>
       <a href="#sec-value">Pricing efficiency</a>
       <a href="#sec-patterns">Work Patterns</a>
@@ -1058,6 +1148,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
         <span id="sidebar-toggle-icon" aria-hidden="true">&raquo;</span><span id="sidebar-toggle-label">Show filters</span>
       </button>
       <aside class="sidebar" id="filter-panel" aria-label="Usage filters">
+      {topic_filter_html}
       <div class="side-panel" id="proj-panel">
         <h2>Projects</h2>
         <input class="filter-search" id="project-search" type="search" aria-label="Search projects" placeholder="Search projects" oninput="searchFilters('project', this.value)">
@@ -1157,6 +1248,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
         </div>
       </div>
 
+      {topic_section_html}
       <div class="section" id="sec-value">
         <div class="section-head"><h2>Cost &amp; pricing efficiency</h2></div>
         <p class="section-desc">Which models deliver the most tokens per dollar spent, and how reasoning effort (a setting, not a model choice) drives cost up. Value here means <b>pricing efficiency</b>, not output quality &mdash; see each chart's <span title="hover the ? icons on the charts below for the full caveat">(?)</span> for details. Cost figures depend on <code>total_nano_aiu</code> coverage being complete for the selected calls &mdash; see the coverage KPI and any warning banner below before trusting a $0 or "cheapest" result.</p>
@@ -1249,6 +1341,10 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
   </div>
 
 <script>
+const TOPICS_ENABLED = {topics_enabled_json};
+let TOPIC_CATALOG = {topic_catalog_json};
+const TOPIC_EDIT_TOKEN = null;
+const STORAGE_KEY_TOPIC = {storage_key_topic_json};
 const RAW = {raw_json};
 // nano_aiu -> USD: verified against GitHub's published per-token Copilot pricing
 // (1 AI credit = $0.01; total_nano_aiu / 1e9 = credits, so /1e11 = USD).
@@ -1374,6 +1470,7 @@ function resetFilters() {{
     if (input) input.value = "";
   }});
   localStorage.setItem(STORAGE_KEY_DATEFILTER, "all");
+  if (TOPICS_ENABLED) localStorage.removeItem(STORAGE_KEY_TOPIC);
   render();
 }}
 
@@ -1512,6 +1609,145 @@ function setMetric(metric) {{
   render();
 }}
 
+function topicName(id) {{
+  return id === "other" ? "Other" :
+    (TOPIC_CATALOG.topics.find(topic => topic.id === id)?.name || "Other");
+}}
+
+function setTopicFilter(topicId) {{
+  localStorage.setItem(STORAGE_KEY_TOPIC, topicId);
+  render();
+}}
+
+function renderTopics(filtered, valKey, fmtVal) {{
+  const grouped = new Map();
+  for (const r of filtered) {{
+    const id = r.topic_id || "other";
+    if (!grouped.has(id)) grouped.set(id, {{ sessions: new Set(), tokens: 0, cost: 0, value: 0 }});
+    const item = grouped.get(id);
+    if (r.session_id) item.sessions.add(JSON.stringify([r.user, r.session_id]));
+    item.tokens += r.total_tokens;
+    item.cost += r.estimated_cost;
+    item.value += r[valKey] || 0;
+  }}
+  const ranked = Array.from(grouped.entries()).sort((a, b) => b[1].value - a[1].value);
+  document.getElementById("topic-table").innerHTML = ranked.map(([id, item]) => `
+    <tr><td>${{escapeHtml(topicName(id))}}</td><td>${{fmt(item.sessions.size)}}</td>
+    <td>${{fmt(item.tokens)}}</td><td>${{fmtCurrency(item.cost)}}</td></tr>`).join("");
+  const chart = document.getElementById("fig_topic");
+  chart.style.height = Math.max(250, ranked.length * 34 + 100) + "px";
+  drawChart("fig_topic", [{{
+    x: ranked.map(([, item]) => item.value), y: ranked.map(([id]) => topicName(id)),
+    type: "bar", orientation: "h", marker: {{ color: OKABE_ITO.blue }},
+    text: ranked.map(([, item]) => fmtVal(item.value)), textposition: "outside",
+    hovertemplate: "%{{y}}: %{{x:,}}<extra></extra>",
+  }}], {{
+    title: {{ text: "Usage by topic" }}, yaxis: {{ autorange: "reversed" }},
+    xaxis: {{ title: {{ text: valKey === "estimated_cost" ? "Estimated USD" : "Input + output tokens" }} }},
+    margin: {{ l: 220, r: 50 }},
+  }}, {{ responsive: true }});
+  if (!TOPIC_EDIT_TOKEN) return;
+  const options = TOPIC_CATALOG.topics.map(topic =>
+    `<option value="${{escapeHtml(topic.id)}}">${{escapeHtml(topic.name)}}</option>`).join("");
+  for (const id of ["topic-rename-id", "topic-edit-id", "topic-merge-source", "topic-merge-target"]) {{
+    const select = document.getElementById(id);
+    const selected = select.value;
+    select.innerHTML = options;
+    if (TOPIC_CATALOG.topics.some(topic => topic.id === selected)) select.value = selected;
+  }}
+  const sessions = new Map();
+  for (const r of filtered) {{
+    if (r.session_id) sessions.set(JSON.stringify([r.user, r.session_id]), r);
+  }}
+  const allOptions = `<option value="other">Other</option>` + options;
+  document.getElementById("topic-session-table").innerHTML =
+    Array.from(sessions.values()).map(r => `
+      <tr><td>${{escapeHtml(r.session_id)}}</td>
+      <td>${{escapeHtml(r.task_summary || "")}}</td>
+      <td><select class="topic-override" data-user="${{escapeHtml(r.user)}}"
+        data-session-id="${{escapeHtml(r.session_id)}}" aria-label="Topic for session ${{escapeHtml(r.session_id)}}">
+        ${{allOptions}}</select></td></tr>`).join("");
+  document.querySelectorAll(".topic-override").forEach(select => {{
+    const key = JSON.stringify([select.dataset.user, select.dataset.sessionId]);
+    select.value = TOPIC_CATALOG.overrides[key] || sessions.get(key)?.topic_id || "other";
+  }});
+}}
+
+function applyTopicCatalog(catalog) {{
+  TOPIC_CATALOG = catalog;
+  const ids = new Set(catalog.topics.map(topic => topic.id));
+  for (const r of RAW) {{
+    if (!r.session_id) continue;
+    const key = JSON.stringify([r.user, r.session_id]);
+    r.topic_id = catalog.overrides[key] || catalog.assignments[key] ||
+      (ids.has(r.topic_id) ? r.topic_id : "other");
+  }}
+  render();
+  if (TOPIC_EDIT_TOKEN) populateTopicRules();
+}}
+
+async function saveTopicEdit(edit) {{
+  const status = document.getElementById("topic-status");
+  try {{
+    const response = await fetch("/api/topics", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json", "X-Topic-Token": TOPIC_EDIT_TOKEN }},
+      body: JSON.stringify(edit),
+    }});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save topic change");
+    applyTopicCatalog(result);
+    status.textContent = "Saved to local topic file.";
+  }} catch (error) {{
+    status.textContent = "Save failed: " + error.message;
+  }}
+}}
+
+function createTopic() {{
+  const example = document.getElementById("topic-new-example").value.trim();
+  saveTopicEdit({{
+    action: "create", name: document.getElementById("topic-new-name").value,
+    examples: example ? [example] : [],
+  }});
+}}
+
+function renameTopic() {{
+  saveTopicEdit({{
+    action: "rename", topic_id: document.getElementById("topic-rename-id").value,
+    name: document.getElementById("topic-rename-name").value,
+  }});
+}}
+
+function populateTopicRules() {{
+  const id = document.getElementById("topic-edit-id").value;
+  const topic = TOPIC_CATALOG.topics.find(item => item.id === id);
+  document.getElementById("topic-edit-examples").value = topic ? topic.examples.join("\\n") : "";
+  document.getElementById("topic-edit-keywords").value = topic ? topic.keywords.join("\\n") : "";
+}}
+
+function updateTopicRules() {{
+  const lines = id => document.getElementById(id).value.split(/\\r?\\n/).map(value => value.trim()).filter(Boolean);
+  saveTopicEdit({{
+    action: "update", topic_id: document.getElementById("topic-edit-id").value,
+    examples: lines("topic-edit-examples"), keywords: lines("topic-edit-keywords"),
+  }});
+}}
+
+function mergeTopic() {{
+  saveTopicEdit({{
+    action: "merge", source_id: document.getElementById("topic-merge-source").value,
+    target_id: document.getElementById("topic-merge-target").value,
+  }});
+}}
+
+if (TOPICS_ENABLED && TOPIC_EDIT_TOKEN) {{
+  document.getElementById("topic-editor").hidden = false;
+  fetch("/api/topics", {{ headers: {{ "X-Topic-Token": TOPIC_EDIT_TOKEN }} }})
+    .then(response => {{ if (!response.ok) throw new Error("Could not load topics"); return response.json(); }})
+    .then(applyTopicCatalog)
+    .catch(error => {{ document.getElementById("topic-status").textContent = error.message; }});
+}}
+
 function getDateFilter() {{ return localStorage.getItem(STORAGE_KEY_DATEFILTER) || "all"; }}
 
 function setDateFilter(v) {{
@@ -1614,6 +1850,7 @@ function renderTaskTable() {{
     <tr>
       <td>${{escapeHtml(row.project)}}</td>
       <td>${{escapeHtml(row.task)}}</td>
+      ${{TOPICS_ENABLED ? `<td>${{escapeHtml(topicName(row.topic_id))}}</td>` : ""}}
       <td style="text-align:right">${{fmt(row.tokens)}}</td>
       <td style="text-align:right">${{fmtCurrency(row.cost)}}</td>
     </tr>
@@ -1634,10 +1871,11 @@ function renderTaskTable() {{
         <thead><tr>
           <th><button class="table-sort" onclick="sortTaskTable('project')">Project${{taskSortIndicator("project")}}</button></th>
           <th><button class="table-sort" onclick="sortTaskTable('task')">Task${{taskSortIndicator("task")}}</button></th>
+          ${{TOPICS_ENABLED ? "<th>Topic</th>" : ""}}
           <th style="text-align:right"><button class="table-sort" onclick="sortTaskTable('tokens')">Total tokens${{taskSortIndicator("tokens")}}</button></th>
           <th style="text-align:right"><button class="table-sort" onclick="sortTaskTable('cost')">Est. cost${{taskSortIndicator("cost")}}</button></th>
         </tr></thead>
-        <tbody>${{htmlRows || '<tr><td colspan="4" style="text-align:center;color:var(--muted);">No matching tasks</td></tr>'}}</tbody>
+        <tbody>${{htmlRows || `<tr><td colspan="${{TOPICS_ENABLED ? 5 : 4}}" style="text-align:center;color:var(--muted);">No matching tasks</td></tr>`}}</tbody>
       </table>
     </div>
   `;
@@ -1664,8 +1902,12 @@ function sortTaskTable(key) {{
 
 function taskTableText() {{
   return [
-    ["Project", "Task", "Total tokens", "Est. cost"],
-    ...getDisplayedTaskRows().map(row => [sanitizeForSpreadsheet(row.project), sanitizeForSpreadsheet(row.task), fmt(row.tokens), fmtCurrency(row.cost)])
+    ["Project", "Task", ...(TOPICS_ENABLED ? ["Topic"] : []), "Total tokens", "Est. cost"],
+    ...getDisplayedTaskRows().map(row => [
+      sanitizeForSpreadsheet(row.project), sanitizeForSpreadsheet(row.task),
+      ...(TOPICS_ENABLED ? [sanitizeForSpreadsheet(topicName(row.topic_id))] : []),
+      fmt(row.tokens), fmtCurrency(row.cost),
+    ])
   ].map(row => row.join("\\t")).join("\\n");
 }}
 
@@ -1797,6 +2039,19 @@ function render() {{
   const excludedProjects = loadExcluded("project");
   const excludedModels = loadExcluded("model");
   const excludedProviders = loadExcluded("provider");
+  let topicFilter = TOPICS_ENABLED ? (localStorage.getItem(STORAGE_KEY_TOPIC) || "") : "";
+  if (TOPICS_ENABLED) {{
+    const ids = new Set(RAW.map(r => r.topic_id));
+    if (topicFilter && !ids.has(topicFilter)) {{
+      topicFilter = "";
+      localStorage.removeItem(STORAGE_KEY_TOPIC);
+    }}
+    const select = document.getElementById("topic-filter");
+    select.innerHTML = '<option value="">All topics</option>' +
+      Array.from(ids).sort((a, b) => topicName(a).localeCompare(topicName(b)))
+        .map(id => `<option value="${{escapeHtml(id)}}">${{escapeHtml(topicName(id))}}</option>`).join("");
+    select.value = topicFilter;
+  }}
   document.querySelectorAll(".proj-check").forEach(cb => {{ cb.checked = !excludedProjects.has(cb.value); }});
   document.querySelectorAll(".model-check").forEach(cb => {{ cb.checked = !excludedModels.has(cb.value); }});
   document.querySelectorAll(".provider-check").forEach(cb => {{ cb.checked = !excludedProviders.has(cb.value); }});
@@ -1833,7 +2088,8 @@ function render() {{
   // OR): a row must pass ALL FOUR to be included. In particular, a model
   // whose own checkbox is still checked is still excluded if its inferred
   // provider is unchecked - see the Provider panel's hint text.
-  const filtered = RAW.filter(r => !excludedProjects.has(r.project) && !excludedModels.has(r.model) && !excludedProviders.has(r.provider) && (!cutoffDateStr || (r.date && r.date >= cutoffDateStr)));
+  const filtered = RAW.filter(r => !excludedProjects.has(r.project) && !excludedModels.has(r.model) && !excludedProviders.has(r.provider) && (!cutoffDateStr || (r.date && r.date >= cutoffDateStr)) && (!topicFilter || r.topic_id === topicFilter));
+  if (TOPICS_ENABLED) renderTopics(filtered, valKey, fmtVal);
 
   // KPIs (always show both tokens and cost, regardless of chart metric toggle)
   const totalTokens = sum(filtered, "total_tokens");
@@ -2247,7 +2503,7 @@ function render() {{
     for (const r of filtered) {{
       if (!r.task_summary) continue;
       const k = r.project + "||" + r.task_summary + "||" + (r.session_id || "");
-      if (!byTask.has(k)) byTask.set(k, {{ project: r.project, task: r.task_summary, tokens: 0, cost: 0 }});
+      if (!byTask.has(k)) byTask.set(k, {{ project: r.project, task: r.task_summary, topic_id: r.topic_id, tokens: 0, cost: 0 }});
       const t = byTask.get(k);
       t.tokens += r.total_tokens;
       t.cost += r.estimated_cost;
@@ -2304,6 +2560,13 @@ function scheduleChartRender() {{
 }}
 
 document.addEventListener("change", (e) => {{
+  if (e.target.classList.contains("topic-override")) {{
+    saveTopicEdit({{
+      action: "override", user: e.target.dataset.user,
+      session_id: e.target.dataset.sessionId, topic_id: e.target.value,
+    }});
+    return;
+  }}
   const kind = Object.keys(FILTER_KINDS).find(k => e.target.classList.contains(FILTER_KINDS[k].checkboxClass));
   if (!kind) return;
   const excluded = loadExcluded(kind);
@@ -2367,15 +2630,49 @@ def main():
              "(irreversible). Work Patterns and Task Detail will show their existing "
              "no-summaries-available state instead of embedding any task_summary values.",
     )
+    ap.add_argument(
+        "--topics", action="store_true",
+        help="Enable offline topic discovery using ~/.ghc-cli-dashboard/topics.json.",
+    )
+    ap.add_argument(
+        "--topics-file", default=None,
+        help="Enable topics with a custom local topic catalog path (overrides --topics default).",
+    )
+    ap.add_argument(
+        "--serve", action="store_true",
+        help="Serve the dashboard on localhost with persistent topic editing; requires --topics or --topics-file.",
+    )
     args = ap.parse_args()
+    if args.serve and not (args.topics or args.topics_file):
+        ap.error("--serve requires --topics or --topics-file")
+    if args.omit_task_summaries and (args.topics or args.topics_file):
+        ap.error("--omit-task-summaries cannot be combined with topics")
 
     data = load_data(args.pattern)
     exclude_default_projects = [p.strip() for p in args.exclude_default.split(",") if p.strip()]
     exclude_default_models = [m.strip() for m in args.exclude_default_models.split(",") if m.strip()]
-    build_dashboard(
-        data, args.out, args.title, exclude_default_projects, exclude_default_models, storage_key=args.out,
-        exclude_projects=args.exclude_projects, omit_task_summaries=args.omit_task_summaries,
+    topic_file = args.topics_file or (
+        Path.home() / ".ghc-cli-dashboard" / "topics.json" if args.topics else None
     )
+    try:
+        build_dashboard(
+            data, args.out, args.title, exclude_default_projects, exclude_default_models, storage_key=args.out,
+            exclude_projects=args.exclude_projects, omit_task_summaries=args.omit_task_summaries,
+            topic_file=topic_file,
+        )
+    except (RuntimeError, ValueError) as exc:
+        sys.exit(f"ERROR: {exc}")
+    if args.serve:
+        from topic_server import make_server
+
+        server = make_server(args.out, topic_file)
+        print(f"Editable dashboard: http://127.0.0.1:{server.server_port}/ (Ctrl+C to stop)", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
 
 
 if __name__ == "__main__":

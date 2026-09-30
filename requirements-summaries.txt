@@ -1,0 +1,2 @@
+# Optional, offline topic summarization; install only when using a local SLM.
+gpt4all>=2.8.2,<3

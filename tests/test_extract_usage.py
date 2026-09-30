@@ -234,6 +234,41 @@ def test_extraction_end_to_end_against_synthetic_db(tmp_path, monkeypatch, capsy
     assert after - before == set()
 
 
+def test_multiple_databases_deduplicate_paths_and_keep_first_session(tmp_path, monkeypatch, capsys):
+    import csv
+
+    first = tmp_path / "first.db"
+    second = tmp_path / "second.db"
+    _make_valid_db(str(first))
+    _make_valid_db(str(second))
+    with sqlite3.connect(second) as conn:
+        conn.execute("UPDATE sessions SET summary = 'Different copy' WHERE id = 's1'")
+        conn.execute("INSERT INTO sessions VALUES ('s2', 'org/other', '/repo/other', 'Other task')")
+        conn.execute(
+            "INSERT INTO assistant_usage_events VALUES "
+            "(3, 's2', '2026-01-02T10:00:00Z', 'gpt-4o', 'medium', 10, 20, 0, 0, 0, 500000000)"
+        )
+    out = tmp_path / "usage.csv"
+    monkeypatch.setattr(sys, "argv", [
+        "extract_usage.py", "--db", str(first), "--db", str(first.resolve()),
+        "--db", str(second), "--out", str(out), "--user-label", "tester",
+    ])
+    extract_usage.main()
+
+    with out.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert {row["session_id"] for row in rows} == {"s1", "s2"}
+    assert next(row for row in rows if row["session_id"] == "s1")["task_summary"] == "Fix bug"
+    assert next(row for row in rows if row["session_id"] == "s1")["calls"] == "2"
+    assert next(row for row in rows if row["session_id"] == "s2")["calls"] == "1"
+    warning = capsys.readouterr().err
+    assert "WARNING" in warning and "s1" in warning and str(second) in warning
+
+
+def test_project_fallback_does_not_expose_windows_parent_paths_on_macos():
+    assert extract_usage.normalize_project(None, r"C:\Users\private\source\project") == "project"
+
+
 # ---------------------------------------------------------------------------
 # cost_data_calls: cost-coverage counter (full / partial / no coverage)
 # ---------------------------------------------------------------------------

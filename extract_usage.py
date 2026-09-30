@@ -23,6 +23,7 @@ each person runs it against their own machine.
 Usage:
     python extract_usage.py
     python extract_usage.py --db "D:\\custom\\path\\session-store.db"
+    python extract_usage.py --db "D:\\first\\session-store.db" --db "E:\\second\\session-store.db"
     python extract_usage.py --user-label "team-alpha-jsmith" --exclude-task-summary
     python extract_usage.py --out "C:\\shared\\team-usage\\jsmith_2026-08-11.csv"
 
@@ -119,8 +120,7 @@ def normalize_project(repository, cwd):
     if repository:
         return repository
     if cwd:
-        cwd = cwd.rstrip("\\/")
-        return os.path.basename(cwd) or cwd
+        return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or "(unknown)"
     return "(unknown)"
 
 
@@ -280,7 +280,7 @@ ORDER BY day DESC
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--db", default=default_db_path(), help="Path to session-store.db (default: ~/.copilot/session-store.db)")
+    ap.add_argument("--db", action="append", default=None, help="Path to session-store.db (repeatable; default: ~/.copilot/session-store.db)")
     ap.add_argument("--out", default=None, help="Output CSV path (default: ./copilot_usage_<user>_<date>.csv)")
     ap.add_argument("--user-label", default=None, help="Label to identify you in a shared/team rollup (default: OS username)")
     summary_options = ap.add_mutually_exclusive_group()
@@ -289,11 +289,30 @@ def main():
     args = ap.parse_args()
 
     user_label = args.user_label or getpass.getuser()
-    with ReadOnlySnapshot(args.db) as conn:
-        validate_schema(conn, args.db)
-        cur = conn.execute(QUERY)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
+    db_paths = list(dict.fromkeys(
+        os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+        for path in (args.db or [default_db_path()])
+    ))
+    rows = []
+    seen_sessions = set()
+    for db_path in db_paths:
+        with ReadOnlySnapshot(db_path) as conn:
+            validate_schema(conn, db_path)
+            session_ids = {row[0] for row in conn.execute("SELECT id FROM sessions")}
+            duplicates = session_ids & seen_sessions
+            if duplicates:
+                sample = ", ".join(sorted(duplicates)[:10])
+                suffix = f" (+{len(duplicates) - 10} more)" if len(duplicates) > 10 else ""
+                print(
+                    f"WARNING: {db_path}: ignoring {len(duplicates)} session(s) already present "
+                    f"in an earlier database: {sample}{suffix}. Later usage for these sessions "
+                    "is excluded.",
+                    file=sys.stderr,
+                )
+            cur = conn.execute(QUERY)
+            rows.extend(row for row in cur.fetchall() if row[0] not in seen_sessions)
+            cols = [d[0] for d in cur.description]
+            seen_sessions.update(session_ids)
 
     out_path = args.out or f"copilot_usage_{user_label}_{datetime.now().strftime('%Y-%m-%d')}.csv"
 

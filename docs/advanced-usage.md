@@ -63,6 +63,112 @@ but produce warnings because their ordering and identity are less certain.
 Keep source CSV files in a location appropriate for their sensitivity. The
 tool does not upload or transmit them.
 
+## Topic classification
+
+Topics are optional. Install `requirements-topics.txt`, then run
+`python dashboard.py --in "copilot_usage_*.csv" --topics --serve`. The URL
+printed by this command is an editable dashboard served **only on localhost**.
+The ordinary generated HTML file is still available for read-only viewing.
+The server saves topic changes atomically to
+`~/.ghc-cli-dashboard/topics.json`; `--topics-file PATH` selects another
+catalog. Keep this file private: it contains session IDs and potentially
+sensitive topic names and example summaries. Do not commit it or share a
+topic-enabled dashboard without reviewing its contents.
+
+The local embedding model (`BAAI/bge-small-en-v1.5` through FastEmbed/ONNX)
+is downloaded on first use (approximately 67 MB), with no paid service.
+Only compact task summaries (or optional SLM-generated topic summaries) are
+embedded. Assignment order is:
+
+1. An explicit per-session correction in the catalog.
+2. The saved automatic assignment from a previous build.
+3. A user-defined topic's `keywords` (whole-word match).
+4. Similarity to a user-defined topic's example summaries (cosine
+   similarity at least 0.67), then to previously discovered topics.
+5. Groups of at least two unmatched summaries at similarity 0.75 or higher
+   become a discovered topic; unmatched singletons remain **Other**.
+
+Discovered topics get stable IDs and names based on a shared summary word
+or representative summary. They are approximate, not LLM-generated.
+In editable mode, create a topic with a name and optional example, edit
+example summaries and exact-phrase rules, rename or merge topics, or change
+a session's selection. Changes to a session are visible immediately and
+override future automatic builds; new matching rules are applied to
+unassigned sessions on the *next* dashboard build. The topic
+filter combines with existing project, model, provider, and date filters.
+Session counts use distinct session IDs, while token/cost sums keep the
+existing dashboard definitions. Rows from legacy CSVs without session IDs
+remain in **Other** and do not contribute to the distinct-session count.
+Session corrections are keyed by the export's user label and session ID;
+changing `--user-label` when re-exporting will not carry over corrections.
+
+Topic generation cannot be combined with `--omit-task-summaries`: a topic
+name derived from a summary could reveal content that option was meant to
+remove. Build-time `--exclude-project` runs before topic classification.
+The browser cannot write the topic file from a standalone `file://` HTML
+dashboard; run `--serve` for editing. The localhost editor checks a
+session-specific token and same-origin requests; no external network
+service receives your usage data. Only model weights are downloaded.
+
+### Optional offline SLM summaries
+
+If stored task summaries are generic, a separate, **opt-in** offline step
+can summarize the first user turn. Install both optional requirements files:
+
+```powershell
+python -m pip install -r requirements-topics.txt -r requirements-summaries.txt
+```
+
+Download `qwen2.5-1.5b-instruct-q4_k_m.gguf` (about 1.1 GB) from the
+[Qwen model repository](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF).
+This step uses GPT4All's native GGUF runner; it does **not** require Ollama,
+a background server, a cloud account, or a paid API. Pass the downloaded
+file explicitly. The runner is never allowed to auto-download a model:
+
+```powershell
+python topic_summarizer.py --in usage.csv --out usage-with-topics.csv `
+  --db "C:\first\.copilot\session-store.db" `
+  --db "D:\other\.copilot\session-store.db" `
+  --model "C:\Models\qwen2.5-1.5b-instruct-q4_k_m.gguf"
+python dashboard.py --in usage-with-topics.csv --topics-file topics-slm.json --serve
+```
+
+Use the **same database order** as the extraction: the first store wins
+when session IDs collide. `--limit 10` is useful for a trial; it leaves
+the remaining sessions on their old task summaries, so do not interpret
+the resulting topic totals as a fully classified dataset. Without a
+limit, the first offline pass can take a while on a large store; the
+versioned cache at `~/.ghc-cli-dashboard/topic-summary-cache.json`
+avoids repeating unchanged work on subsequent runs. `--cache PATH` selects
+a different cache. The limit counts **new** summaries per run; use
+`--limit 0` to rebuild the export using only cached labels, or omit the
+limit to finish the full dataset. The cache is keyed by user/session, the selected GGUF
+file's metadata, and the input text; generated summaries are saved after
+each session so an interrupted run can resume. No raw user turn is written
+to the enriched CSV or cache. Both files may still contain sensitive
+topic names and session IDs; keep them private. First turns are read from
+read-only SQLite snapshots. Shared launcher lines are removed within
+each store only when they occur in at least half of 20 or more first
+messages; longer remaining text is summarized in bounded pieces and
+combined. These are heuristics: inspect the results and use the
+dashboard's manual corrections as needed.
+
+Use a **new** `--topics-file` for the SLM-enriched export if the same
+sessions were already classified from the old generic summaries: saved
+automatic topic assignments intentionally retain their IDs until you
+correct or merge them. The original CSV and existing cost calculations
+are unchanged.
+
+`extract_usage.py` accepts multiple `--db` arguments. Without one, it reads
+`~/.copilot/session-store.db`; explicit arguments replace that default.
+Pass each custom Copilot home's `session-store.db` to avoid partial usage.
+Repeated references to the same physical path are silently deduplicated.
+If the same session ID exists in different databases, a warning identifies
+the overlap and the **first specified database wins** for that entire
+session. Later rows for it are ignored, even if they contain newer calls.
+The dashboard's separate deduplication of overlapping CSV exports still
+applies after extraction.
+
 ## Filters and providers
 
 Projects, models, providers, and date range all apply together. Disabling a

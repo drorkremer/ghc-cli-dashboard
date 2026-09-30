@@ -41,9 +41,45 @@ out, and review the privacy implications before sharing a CSV or dashboard.
 - Trends by day, week, or month.
 - Input, output, cache, and reasoning token categories.
 - Model mix, provider mix, reasoning effort, and task detail.
+- Optional local topic discovery and per-session topic corrections, with
+  usage and existing cost totals by topic.
 
 The dashboard estimates cost from usage data recorded by Copilot CLI. It does
 not represent an invoice.
+
+### Optional topics
+
+Install the optional, local embedding model support:
+
+```powershell
+python -m pip install -r requirements-topics.txt
+python extract_usage.py --db "C:\first\.copilot\session-store.db" `
+  --db "D:\other\.copilot\session-store.db"
+python dashboard.py --in "copilot_usage_*.csv" --topics --serve
+```
+
+Open the localhost URL printed by `dashboard.py`. The **Topics** section
+shows discovered groups and lets you create or rename topics, merge groups,
+and correct individual session assignments. These changes are saved to
+`~/.ghc-cli-dashboard/topics.json` and reused on the next dashboard build.
+Use `--topics-file PATH` to choose another local catalog. For a static,
+read-only HTML export, omit `--serve`.
+
+The model downloads once on first use (roughly 67 MB), then processes
+summaries locally. No session text is sent to a classification service, and
+nothing runs in the Copilot request path. Automatic labels are suggestions.
+See [topic classification and source selection](docs/advanced-usage.md#topic-classification).
+
+If Copilot's stored task summaries are generic or repeated, an **optional
+offline SLM step** can summarize the first user turn into a better
+classification input. Install `requirements-summaries.txt`, download a
+[Qwen2.5-1.5B-Instruct Q4_K_M GGUF](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF),
+and run `topic_summarizer.py --in usage.csv --out usage-with-topics.csv
+--db PATH_TO_SESSION_STORE --model PATH_TO_GGUF`. Then build the dashboard
+from `usage-with-topics.csv` with `--topics`. The raw user messages stay in
+the local Copilot stores; the enriched CSV contains only short generated
+summaries, and a private cache makes subsequent runs incremental. See the
+[offline SLM instructions](docs/advanced-usage.md#optional-offline-slm-summaries).
 
 ### Exploring your usage
 

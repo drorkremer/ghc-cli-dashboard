@@ -3,6 +3,7 @@ copilot_usage_*.csv
 usage_dashboard*.html
 team_usage_dashboard*.html
 *.html
+topics.json
 
 # Sample/screenshot scratch output from tools/
 sample_usage*.csv
