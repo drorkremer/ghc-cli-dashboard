@@ -49,10 +49,10 @@ def action(name, *args):
     return {"name": name, "args": list(args)}
 
 
-def test_three_primary_kpis_and_trend_before_project_ranking(ui_dashboard):
+def test_four_primary_kpis_and_trend_before_project_ranking(ui_dashboard):
     out = run_ui(ui_dashboard)
     kpis = out["elements"]["kpi-row"]["innerHTML"]
-    assert kpis.count('class="kpi"') == 3
+    assert kpis.count('class="kpi"') == 4
     assert "Cost data coverage: 100%" in kpis
     assert "119K" in kpis
     assert "119,000" in kpis  # exact total is still accessible
@@ -231,7 +231,7 @@ def test_responsive_layout_and_filter_interactions(ui_dashboard, browser_page, w
     assert page.locator(".token-glossary .token-glossary-item").count() == 5
     assert page.locator(".token-glossary").evaluate("(el) => el.tagName") == "DETAILS"
     assert page.evaluate("document.documentElement.scrollWidth") <= width
-    assert page.locator("#kpi-row > .kpi").count() == 3
+    assert page.locator("#kpi-row > .kpi").count() == 4
     if width == 1440:
         assert page.locator("#fig_trend").bounding_box()["y"] + 300 < height
     if width <= 760:

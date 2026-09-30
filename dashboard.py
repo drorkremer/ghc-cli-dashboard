@@ -39,7 +39,7 @@ from plotly.colors import qualitative
 from plotly.offline import get_plotlyjs
 
 from provider_classifier import PROVIDER_COLORS, classify_provider
-from topic_classifier import OTHER, classify, session_key
+from topic_classifier import DELIVERABLE_TYPES, OTHER, classify, classify_tagged, session_key
 
 # Columns every input CSV must have for a record to be constructed at all -
 # these are read unconditionally (no getattr/default) in build_dashboard().
@@ -732,6 +732,25 @@ def _nullable_int(value):
     return int(value)
 
 
+def _topic_list(value, field, max_items):
+    if value is None or (isinstance(value, float) and pd.isna(value)) or value == "":
+        return []
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a JSON list")
+    try:
+        labels = json.loads(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a JSON list") from exc
+    if (not isinstance(labels, list) or len(labels) > max_items
+            or any(not isinstance(label, str) or not label.strip() or len(label) > 120
+                   for label in labels)
+            or len({label.casefold() for label in labels}) != len(labels)):
+        raise ValueError(f"{field} must contain at most {max_items} distinct labels")
+    if field == "topic_deliverables" and any(label not in DELIVERABLE_TYPES for label in labels):
+        raise ValueError("topic_deliverables contains an unknown type")
+    return labels
+
+
 def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
                      exclude_default_projects: list, exclude_default_models: list,
                      storage_key: str, exclude_projects: list = None,
@@ -753,7 +772,11 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
 
     has_tasks = "task_summary" in data.columns
     has_effort = "reasoning_effort" in data.columns
+    multi_topic = "topic_subjects" in data.columns or "topic_deliverables" in data.columns
+    if multi_topic and not {"topic_subjects", "topic_deliverables"} <= set(data.columns):
+        raise ValueError("multi-topic export requires both topic_subjects and topic_deliverables")
     topic_assignments = {}
+    subject_tags = {}
     topic_catalog = None
     if topic_file:
         sessions = {}
@@ -761,11 +784,28 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
             sid = getattr(row, "session_id", None)
             if isinstance(sid, str) and sid:
                 key = session_key(str(row.user), sid)
-                summary = getattr(row, "topic_summary", None)
-                if not isinstance(summary, str) or not summary.strip():
+                subjects = _topic_list(getattr(row, "topic_subjects"), "topic_subjects", 3) if multi_topic else []
+                deliverables = _topic_list(
+                    getattr(row, "topic_deliverables"), "topic_deliverables", len(DELIVERABLE_TYPES),
+                ) if multi_topic else []
+                summary = subjects[0] if multi_topic and subjects else (
+                    getattr(row, "topic_summary", None) if not multi_topic else None
+                )
+                if not multi_topic and (not isinstance(summary, str) or not summary.strip()):
                     summary = getattr(row, "task_summary", None)
-                sessions.setdefault(key, (str(row.user), sid, summary))
-        topic_assignments, topic_catalog = classify(sessions.values(), topic_file)
+                details = (str(row.user), sid, summary, subjects[1:], deliverables)
+                if key in sessions and sessions[key] != details:
+                    raise ValueError(f"conflicting topic labels for session {sid}")
+                sessions[key] = details
+        if multi_topic:
+            topic_assignments, subject_tags, topic_catalog = classify_tagged(
+                (details[:4] for details in sessions.values()), topic_file,
+            )
+        else:
+            topic_assignments, topic_catalog = classify(
+                ((user, sid, summary) for user, sid, summary, _, _ in sessions.values()),
+                topic_file,
+            )
 
     records = []
     for r in data.itertuples():
@@ -801,10 +841,33 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
         }
         if topic_file:
             sid = rec["session_id"]
+            key = session_key(str(r.user), sid) if isinstance(sid, str) and sid else None
             rec["topic_id"] = (
-                topic_assignments.get(session_key(str(r.user), sid), OTHER)
-                if isinstance(sid, str) and sid else OTHER
+                topic_assignments.get(key, OTHER) if key else OTHER
             )
+            rec["topic_ids"] = (
+                subject_tags.get(key, []) if multi_topic else list(dict.fromkeys(
+                    topic_id for topic_id in [
+                        rec["topic_id"],
+                        *topic_catalog.get("tag_overrides", {}).get(key, []),
+                    ] if topic_id != OTHER
+                ))
+            )
+            rec["topic_extra_ids"] = [
+                topic_id for topic_id in rec["topic_ids"] if topic_id != rec["topic_id"]
+            ]
+            rec["topic_subject_count"] = len(sessions[key][3]) if multi_topic and key else 0
+            rec["topic_deliverables"] = (
+                topic_catalog.get("deliverable_overrides", {}).get(
+                    key, sessions[key][4] if multi_topic else [],
+                ) if key else []
+            )
+            topic_summary = getattr(r, "topic_summary", None)
+            rec["topic_summary"] = (
+                topic_summary if isinstance(topic_summary, str) and topic_summary.strip() else ""
+            )
+            if multi_topic and "topic_status" in data.columns:
+                rec["topic_status"] = getattr(r, "topic_status", "")
         if has_tasks:
             rec["task_summary"] = getattr(r, "task_summary", "") or ""
         records.append(rec)
@@ -830,14 +893,37 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     # All of these are embedded verbatim inside a <script> block below, so they
     # go through _json_for_script (not plain json.dumps) - see its docstring.
     raw_json = _json_for_script(records)
-    used_topic_ids = {rec["topic_id"] for rec in records} if topic_file else set()
+    used_topic_ids = (
+        {topic_id for rec in records for topic_id in [rec["topic_id"], *rec["topic_ids"]]}
+        if topic_file else set()
+    )
     topic_catalog_json = _json_for_script({
         "topics": [
             {"id": topic["id"], "name": topic["name"], "kind": topic["kind"]}
             for topic in (topic_catalog["topics"] if topic_catalog else [])
             if topic["id"] in used_topic_ids
         ],
-        "assignments": {}, "overrides": {},
+        "assignments": {}, "overrides": {}, "tag_overrides": {},
+        "deliverable_overrides": {},
+        "families": [
+            {"id": family["id"], "name": family["name"]}
+            for family in topic_catalog.get("families", [])
+            if family["id"] in {
+                topic_catalog.get("family_overrides", {}).get(
+                    topic_id, topic_catalog.get("family_assignments", {}).get(topic_id)
+                ) for topic_id in used_topic_ids
+            }
+        ] if topic_catalog else [],
+        "family_assignments": {
+            topic_id: family_id
+            for topic_id, family_id in topic_catalog.get("family_assignments", {}).items()
+            if topic_id in used_topic_ids
+        } if topic_catalog else {},
+        "family_overrides": {
+            topic_id: family_id
+            for topic_id, family_id in topic_catalog.get("family_overrides", {}).items()
+            if topic_id in used_topic_ids
+        } if topic_catalog else {},
     })
     topics_enabled_json = str(bool(topic_file)).lower()
     project_order_json = _json_for_script(project_order)
@@ -858,9 +944,13 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     storage_key_provider_json = _json_for_script(f"copilot_usage_excluded_providers::{storage_key}")
     storage_key_metric_json = _json_for_script(f"copilot_usage_metric::{storage_key}")
     storage_key_datefilter_json = _json_for_script(f"copilot_usage_datefilter::{storage_key}")
+    storage_key_daterange_json = _json_for_script(f"copilot_usage_date_range::{storage_key}")
     storage_key_trend_json = _json_for_script(f"copilot_usage_trend_granularity::{storage_key}")
+    storage_key_trend_mode_json = _json_for_script(f"copilot_usage_trend_mode::{storage_key}")
     storage_key_sidebar_json = _json_for_script(f"copilot_usage_sidebar_collapsed::{storage_key}")
     storage_key_topic_json = _json_for_script(f"copilot_usage_topic::{storage_key}")
+    storage_key_family_json = _json_for_script(f"copilot_usage_family::{storage_key}")
+    storage_key_deliverable_json = _json_for_script(f"copilot_usage_deliverable::{storage_key}")
 
     project_checkbox_items = _checkbox_items(project_order, projects_by_tokens, "proj-check")
     model_checkbox_items = _checkbox_items(model_order, models_by_tokens, "model-check")
@@ -868,17 +958,35 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     topic_nav_html = '<a href="#sec-topics">Topics</a>' if topic_file else ""
     topic_filter_html = (
         '<div class="side-panel" id="topic-panel"><h2>Topics</h2>'
-        '<label for="topic-filter" class="hint">Filter by topic</label>'
-        '<select id="topic-filter" class="topic-filter" onchange="setTopicFilter(this.value)" '
-        'aria-label="Filter by topic"></select></div>'
+        '<label for="family-filter" class="hint">Filter by family (match any)</label>'
+        '<select id="family-filter" class="topic-filter" multiple size="5" '
+        'onchange="setFamilyFilter(Array.from(this.selectedOptions, option => option.value))" '
+        'aria-label="Filter by families; select multiple"></select>'
+        '<div class="hint">Cmd/Ctrl-click for multiple. '
+        '<span id="family-selection-summary" role="status">All families</span> '
+        '<button type="button" class="filter-only" onclick="setFamilyFilter([])">Clear</button></div>'
+        '<label for="topic-filter" class="hint">Filter by topics (match any)</label>'
+        '<select id="topic-filter" class="topic-filter" multiple size="7" '
+        'onchange="setTopicFilter(Array.from(this.selectedOptions, option => option.value))" '
+        'aria-label="Filter by topics; select multiple"></select>'
+        '<div class="hint">Only topics matching other filters appear. Cmd/Ctrl-click for multiple. '
+        '<span id="topic-selection-summary" role="status">All topics</span> '
+        '<button type="button" class="filter-only" onclick="setTopicFilter([])">Clear</button></div>'
+        '<label for="deliverable-filter" class="hint">Filter by deliverables (match any)</label>'
+        '<select id="deliverable-filter" class="topic-filter" multiple size="5" '
+        'onchange="setDeliverableFilter(Array.from(this.selectedOptions, option => option.value))" '
+        'aria-label="Filter by deliverables; select multiple"></select>'
+        '<div class="hint"><span id="deliverable-selection-summary" role="status">All deliverables</span> '
+        '<button type="button" class="filter-only" onclick="setDeliverableFilter([])">Clear</button></div></div>'
         if topic_file else ""
     )
     topic_section_html = """
       <div class="section" id="sec-topics">
         <div class="section-head"><h2>Topics</h2></div>
-        <p class="section-desc">Offline, session-level topic suggestions. Costs use the existing
-          nano-AIU figure; sessions are counted once even when multiple models or days are selected.
-          Correct suggestions in editable localhost mode.</p>
+        <p class="section-desc">Subjects and deliverables are independent labels. This chart
+          assigns each session's cost to its primary subject only, so totals do not double count.
+          Filter by any subject or deliverable to inspect matching sessions and their full
+          filtered costs. Correct suggestions in editable localhost mode.</p>
         <div class="card"><div id="fig_topic" style="height:360px;"></div></div>
         <div class="card" style="margin-top:14px;overflow-x:auto;">
           <table><thead><tr><th>Topic</th><th>Sessions</th><th>Tokens</th>
@@ -910,9 +1018,23 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
             <label>into <select id="topic-merge-target"></select></label>
             <button class="table-action" onclick="mergeTopic()">Merge</button>
           </div>
+          <h3>Topic families</h3>
+          <label>New family <input id="family-new-name" maxlength="120"></label>
+          <button class="table-action" onclick="createFamily()">Create family</button>
+          <div>
+            <label>Family <select id="family-rename-id"></select></label>
+            <label>New name <input id="family-rename-name" maxlength="120"></label>
+            <button class="table-action" onclick="renameFamily()">Rename family</button>
+          </div>
+          <div>
+            <label>Topic <select id="family-topic-id" onchange="populateTopicFamily()"></select></label>
+            <label>Assign to <select id="family-assign-id"></select></label>
+            <button class="table-action" onclick="assignFamily()">Save family</button>
+          </div>
           <h3>Session corrections</h3>
           <div style="overflow-x:auto;"><table><thead><tr><th>Session</th>
-          <th>Task</th><th>Topic</th></tr></thead>
+          <th>Task</th><th>Primary subject</th><th>Other subjects</th>
+          <th>Deliverables</th></tr></thead>
           <tbody id="topic-session-table"></tbody></table></div>
         </div>
       </div>
@@ -993,7 +1115,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
   }}
   .sidebar-toggle:hover {{ background: #f6f8fb; color: var(--text); }}
   .main {{ flex: 1; min-width: 0; }}
-  .kpi-row {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 12px; }}
+  .kpi-row {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 12px; }}
   /* Aggregate KPIs share one blue accent; chart palettes follow the encoded data type. */
   .kpi {{
     background: var(--card-bg); border: 1px solid var(--border); border-top: 3px solid #0072b2; border-radius: 10px;
@@ -1036,6 +1158,11 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
   .table-action {{ padding: 7px 12px; border: 1px solid var(--border); border-radius: 6px; background: #f6f8fb; cursor: pointer; font-size: 12px; font-weight: 650; }}
   .table-action:hover {{ background: #e9eef7; }}
   .table-status {{ font-size: 12px; color: var(--muted); }}
+  .session-controls {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }}
+  .session-controls label {{ font-size: 12px; font-weight: 650; color: var(--muted); }}
+  .session-controls select, .session-controls input {{ padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: white; color: var(--text); }}
+  .session-controls input {{ flex: 1 1 240px; min-width: 150px; }}
+  .session-open {{ border: 0; background: none; color: var(--accent-dark); text-decoration: underline; cursor: pointer; font: inherit; }}
   .table-sort {{ border: 0; padding: 0; background: transparent; color: inherit; font: inherit; font-weight: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; }}
   .table-sort:hover {{ color: var(--accent-dark); }}
   .full {{ grid-column: 1 / -1; }}
@@ -1100,6 +1227,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
   .chart-help p {{ margin: 8px 0; }}
   @media (max-width: 1100px) {{
     .grid {{ grid-template-columns: minmax(0, 1fr); }}
+    .kpi-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     .kpi-value {{ font-size: 30px; }}
   }}
   @media (max-width: 760px) {{
@@ -1111,7 +1239,6 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     .sidebar-toggle {{ align-self: flex-start; }}
     .layout.sidebar-collapsed #sidebar-toggle-label {{ display: inline; }}
     .kpi-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
-    .kpi:last-child {{ grid-column: 1 / -1; }}
     .kpi {{ padding: 12px; }}
     .kpi-value {{ font-size: 28px; }}
     .section-desc, .trend-toggle {{ margin-left: 0; }}
@@ -1134,6 +1261,7 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
     <div class="nav-pills">
       <a href="#sec-overview">Overview</a>
       {topic_nav_html}
+      <a href="#sec-sessions">Sessions</a>
       <a href="#sec-trends">Trends</a>
       <a href="#sec-value">Pricing efficiency</a>
       <a href="#sec-patterns">Work Patterns</a>
@@ -1222,9 +1350,15 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
               <button id="trend-week" onclick="setTrendGranularity('week')">Week</button>
               <button id="trend-month" onclick="setTrendGranularity('month')">Month</button>
             </div>
+            <div class="trend-toggle">
+              <span class="metric-label">View:</span>
+              <button id="trend-period" onclick="setTrendMode('period')">Period</button>
+              <button id="trend-cumulative" onclick="setTrendMode('cumulative')">Cumulative</button>
+            </div>
           </div>
+          <p class="section-desc">Drag to zoom into a date range and filter the whole dashboard. Double-click the chart or choose All time to reset.</p>
           <div class="card">
-            <span class="info-icon" title="Usage for the selected projects, models and dates. Weeks start on Monday; months use calendar months. The latest period may be incomplete.">?</span>
+            <span class="info-icon" title="Chart zoom filters all views by date. Cumulative totals start at zero at the selected date range's beginning; empty periods stay flat. Weeks start on Monday; months use calendar months. The latest period may be incomplete.">?</span>
             <div id="fig_trend" style="height:300px;"></div>
           </div>
           <div id="insight-trends" class="insight-bar"></div>
@@ -1249,6 +1383,38 @@ def build_dashboard(data: pd.DataFrame, out_path: str, title: str,
       </div>
 
       {topic_section_html}
+      <div class="section" id="sec-sessions">
+        <div class="section-head"><h2>Session explorer</h2></div>
+        <p class="section-desc">Trace the current project, model, provider, topic, and date filters to individual sessions.
+          Select another grouping or a session to see its model/day rows. Totals reflect the filtered
+          scope, which may be only part of a session. Cost is the same nano-AIU-derived estimate as above.</p>
+        <div class="card" style="overflow-x:auto;">
+          <div class="session-controls">
+            <label for="session-group-kind">Group by</label>
+            <select id="session-group-kind" onchange="setSessionGroup(this.value, '')">
+              <option value="">All selected usage</option>
+              <option value="project">Project</option><option value="model">Model</option>
+              <option value="provider">Provider</option>
+              {'<option value="topic">Topic</option>' if topic_file else ''}
+              {'<option value="primary_topic">Primary topic</option>' if topic_file else ''}
+              {'<option value="deliverable">Deliverable</option>' if topic_file else ''}
+              <option value="user">User</option><option value="effort">Reasoning effort</option>
+              <option value="day">Day</option><option value="week">Week</option>
+              <option value="month">Month</option><option value="theme">Task theme</option>
+              <option value="mode">Work mode</option>
+            </select>
+            <select id="session-group-value" aria-label="Selected group" onchange="setSessionGroup(document.getElementById('session-group-kind').value, this.value)"></select>
+            <input id="session-search" type="search" aria-label="Search sessions"
+              placeholder="Search session ID, project, or summary" oninput="searchSessions(this.value)">
+            <span id="session-status" class="table-status" role="status"></span>
+          </div>
+          <table><thead><tr><th>Session</th><th>Project</th><th>Subjects</th><th>Deliverables</th><th>Models</th>
+            <th>Dates</th><th>Calls</th><th>Tokens</th><th>Est. cost</th></tr></thead>
+            <tbody id="session-table"></tbody></table>
+          <button class="table-action" id="session-more" onclick="showMoreSessions()">Show more sessions</button>
+        </div>
+        <div class="card" id="session-detail" style="margin-top:14px;">No session selected.</div>
+      </div>
       <div class="section" id="sec-value">
         <div class="section-head"><h2>Cost &amp; pricing efficiency</h2></div>
         <p class="section-desc">Which models deliver the most tokens per dollar spent, and how reasoning effort (a setting, not a model choice) drives cost up. Value here means <b>pricing efficiency</b>, not output quality &mdash; see each chart's <span title="hover the ? icons on the charts below for the full caveat">(?)</span> for details. Cost figures depend on <code>total_nano_aiu</code> coverage being complete for the selected calls &mdash; see the coverage KPI and any warning banner below before trusting a $0 or "cheapest" result.</p>
@@ -1345,6 +1511,8 @@ const TOPICS_ENABLED = {topics_enabled_json};
 let TOPIC_CATALOG = {topic_catalog_json};
 const TOPIC_EDIT_TOKEN = null;
 const STORAGE_KEY_TOPIC = {storage_key_topic_json};
+const STORAGE_KEY_FAMILY = {storage_key_family_json};
+const STORAGE_KEY_DATE_RANGE = {storage_key_daterange_json};
 const RAW = {raw_json};
 // nano_aiu -> USD: verified against GitHub's published per-token Copilot pricing
 // (1 AI credit = $0.01; total_nano_aiu / 1e9 = credits, so /1e11 = USD).
@@ -1405,7 +1573,9 @@ const STORAGE_KEY_PROVIDER = {storage_key_provider_json};
 const STORAGE_KEY_METRIC = {storage_key_metric_json};
 const STORAGE_KEY_DATEFILTER = {storage_key_datefilter_json};
 const STORAGE_KEY_TREND = {storage_key_trend_json};
+const STORAGE_KEY_TREND_MODE = {storage_key_trend_mode_json};
 const STORAGE_KEY_SIDEBAR = {storage_key_sidebar_json};
+const STORAGE_KEY_DELIVERABLE = {storage_key_deliverable_json};
 const DEFAULT_EXCLUDED_PROJECTS = {exclude_default_projects_json};
 const DEFAULT_EXCLUDED_MODELS = {exclude_default_models_json};
 const DEFAULT_EXCLUDED_PROVIDERS = {exclude_default_providers_json};
@@ -1470,7 +1640,12 @@ function resetFilters() {{
     if (input) input.value = "";
   }});
   localStorage.setItem(STORAGE_KEY_DATEFILTER, "all");
-  if (TOPICS_ENABLED) localStorage.removeItem(STORAGE_KEY_TOPIC);
+  localStorage.removeItem(STORAGE_KEY_DATE_RANGE);
+  if (TOPICS_ENABLED) {{
+    localStorage.removeItem(STORAGE_KEY_TOPIC);
+    localStorage.removeItem(STORAGE_KEY_FAMILY);
+    localStorage.removeItem(STORAGE_KEY_DELIVERABLE);
+  }}
   render();
 }}
 
@@ -1614,8 +1789,58 @@ function topicName(id) {{
     (TOPIC_CATALOG.topics.find(topic => topic.id === id)?.name || "Other");
 }}
 
-function setTopicFilter(topicId) {{
-  localStorage.setItem(STORAGE_KEY_TOPIC, topicId);
+function familyOf(topicId) {{
+  if (topicId === "other") return "uncategorized";
+  return TOPIC_CATALOG.family_overrides?.[topicId] ||
+    TOPIC_CATALOG.family_assignments?.[topicId] || "uncategorized";
+}}
+
+function rowTopics(row) {{
+  return new Set([row.topic_id || "other", ...(row.topic_ids || [])]);
+}}
+
+function rowInFamily(row, familyIds) {{
+  return !familyIds.length || [...rowTopics(row)].some(id => familyIds.includes(familyOf(id)));
+}}
+
+function loadFacetFilters(key) {{
+  const saved = localStorage.getItem(key);
+  if (!saved) return [];
+  try {{
+    const parsed = JSON.parse(saved);
+    if (Array.isArray(parsed) && parsed.every(id => typeof id === "string"))
+      return [...new Set(parsed.filter(Boolean))];
+    if (typeof parsed === "string") return parsed ? [parsed] : [];
+  }} catch (e) {{
+    if (!saved.startsWith("[") && !saved.startsWith('"'))
+      return [saved]; // Legacy single selections were stored as bare IDs.
+  }}
+  console.warn("Ignoring invalid saved facet selection");
+  localStorage.removeItem(key);
+  return [];
+}}
+
+function saveFacetFilters(key, values) {{
+  const selected = Array.isArray(values) ? values : [values];
+  if (selected.some(id => typeof id !== "string"))
+    throw new TypeError("facet filters must be text IDs");
+  const ids = [...new Set(selected.filter(Boolean))];
+  if (ids.length) localStorage.setItem(key, JSON.stringify(ids));
+  else localStorage.removeItem(key);
+}}
+
+function setFamilyFilter(familyIds) {{
+  saveFacetFilters(STORAGE_KEY_FAMILY, familyIds);
+  render();
+}}
+
+function setTopicFilter(topicIds) {{
+  saveFacetFilters(STORAGE_KEY_TOPIC, topicIds);
+  render();
+}}
+
+function setDeliverableFilter(deliverables) {{
+  saveFacetFilters(STORAGE_KEY_DELIVERABLE, deliverables);
   render();
 }}
 
@@ -1631,13 +1856,18 @@ function renderTopics(filtered, valKey, fmtVal) {{
     item.value += r[valKey] || 0;
   }}
   const ranked = Array.from(grouped.entries()).sort((a, b) => b[1].value - a[1].value);
-  document.getElementById("topic-table").innerHTML = ranked.map(([id, item]) => `
-    <tr><td>${{escapeHtml(topicName(id))}}</td><td>${{fmt(item.sessions.size)}}</td>
+  const topicTable = document.getElementById("topic-table");
+  topicTable.innerHTML = ranked.map(([id, item]) => `
+    <tr><td><button class="session-open topic-drill" data-topic-id="${{escapeHtml(id)}}">${{escapeHtml(topicName(id))}}</button></td><td>${{fmt(item.sessions.size)}}</td>
     <td>${{fmt(item.tokens)}}</td><td>${{fmtCurrency(item.cost)}}</td></tr>`).join("");
+  topicTable.querySelectorAll(".topic-drill").forEach(button =>
+    button.addEventListener("click", () => drillToSessions("primary_topic", button.dataset.topicId))
+  );
   const chart = document.getElementById("fig_topic");
   chart.style.height = Math.max(250, ranked.length * 34 + 100) + "px";
   drawChart("fig_topic", [{{
     x: ranked.map(([, item]) => item.value), y: ranked.map(([id]) => topicName(id)),
+    customdata: ranked.map(([id]) => id),
     type: "bar", orientation: "h", marker: {{ color: OKABE_ITO.blue }},
     text: ranked.map(([, item]) => fmtVal(item.value)), textposition: "outside",
     hovertemplate: "%{{y}}: %{{x:,}}<extra></extra>",
@@ -1655,22 +1885,57 @@ function renderTopics(filtered, valKey, fmtVal) {{
     select.innerHTML = options;
     if (TOPIC_CATALOG.topics.some(topic => topic.id === selected)) select.value = selected;
   }}
+  for (const id of ["family-topic-id"]) {{
+    const select = document.getElementById(id);
+    const selected = select.value;
+    select.innerHTML = options;
+    if (TOPIC_CATALOG.topics.some(topic => topic.id === selected)) select.value = selected;
+  }}
+  const familyOptions = (TOPIC_CATALOG.families || []).map(family =>
+    `<option value="${{escapeHtml(family.id)}}">${{escapeHtml(family.name)}}</option>`).join("");
+  const renameFamilySelect = document.getElementById("family-rename-id");
+  const selectedFamily = renameFamilySelect.value;
+  renameFamilySelect.innerHTML = familyOptions;
+  if ((TOPIC_CATALOG.families || []).some(family => family.id === selectedFamily))
+    renameFamilySelect.value = selectedFamily;
+  document.getElementById("family-assign-id").innerHTML =
+    '<option value="uncategorized">Uncategorized</option>' + familyOptions;
+  populateTopicFamily();
   const sessions = new Map();
   for (const r of filtered) {{
     if (r.session_id) sessions.set(JSON.stringify([r.user, r.session_id]), r);
   }}
   const allOptions = `<option value="other">Other</option>` + options;
+  const extraOptions = options;
+  const deliverableOptions = ["code", "deck", "doc", "info", "data", "config", "other"]
+    .map(value => `<option value="${{value}}">${{value}}</option>`).join("");
   document.getElementById("topic-session-table").innerHTML =
     Array.from(sessions.values()).map(r => `
       <tr><td>${{escapeHtml(r.session_id)}}</td>
-      <td>${{escapeHtml(r.task_summary || "")}}</td>
+      <td>${{escapeHtml(r.topic_summary || r.task_summary || "")}}</td>
       <td><select class="topic-override" data-user="${{escapeHtml(r.user)}}"
         data-session-id="${{escapeHtml(r.session_id)}}" aria-label="Topic for session ${{escapeHtml(r.session_id)}}">
-        ${{allOptions}}</select></td></tr>`).join("");
+        ${{allOptions}}</select></td>
+      <td><select class="topic-tags-override" multiple size="3" data-user="${{escapeHtml(r.user)}}"
+        data-session-id="${{escapeHtml(r.session_id)}}" aria-label="Additional subjects for session ${{escapeHtml(r.session_id)}}">
+        ${{extraOptions}}</select></td>
+      <td><select class="deliverables-override" multiple size="3" data-user="${{escapeHtml(r.user)}}"
+        data-session-id="${{escapeHtml(r.session_id)}}" aria-label="Deliverables for session ${{escapeHtml(r.session_id)}}">
+        ${{deliverableOptions}}</select></td></tr>`).join("");
   document.querySelectorAll(".topic-override").forEach(select => {{
     const key = JSON.stringify([select.dataset.user, select.dataset.sessionId]);
     select.value = TOPIC_CATALOG.overrides[key] || sessions.get(key)?.topic_id || "other";
   }});
+  for (const [cssClass, selected] of [
+    ["topic-tags-override", r => r.topic_extra_ids || []],
+    ["deliverables-override", r => r.topic_deliverables || []],
+  ]) {{
+    document.querySelectorAll("." + cssClass).forEach(select => {{
+      const key = JSON.stringify([select.dataset.user, select.dataset.sessionId]);
+      const values = new Set(selected(sessions.get(key)));
+      for (const option of select.options) option.selected = values.has(option.value);
+    }});
+  }}
 }}
 
 function applyTopicCatalog(catalog) {{
@@ -1681,9 +1946,41 @@ function applyTopicCatalog(catalog) {{
     const key = JSON.stringify([r.user, r.session_id]);
     r.topic_id = catalog.overrides[key] || catalog.assignments[key] ||
       (ids.has(r.topic_id) ? r.topic_id : "other");
+    if (Object.prototype.hasOwnProperty.call(catalog.tag_overrides || {{}}, key))
+      r.topic_extra_ids = catalog.tag_overrides[key];
+    else if (r.topic_subject_count)
+      r.topic_extra_ids = Array.from({{ length: r.topic_subject_count }}, (_, index) =>
+        catalog.assignments[JSON.stringify([r.user, r.session_id + "\\u0000subject\\u0000" + index])]
+      ).filter(id => id && id !== "other");
+    if (Object.prototype.hasOwnProperty.call(catalog.deliverable_overrides || {{}}, key))
+      r.topic_deliverables = catalog.deliverable_overrides[key];
+    r.topic_ids = [...new Set([r.topic_id, ...(r.topic_extra_ids || [])].filter(id => id !== "other"))];
   }}
   render();
   if (TOPIC_EDIT_TOKEN) populateTopicRules();
+}}
+
+function createFamily() {{
+  saveTopicEdit({{ action: "create_family", name: document.getElementById("family-new-name").value }});
+}}
+
+function renameFamily() {{
+  saveTopicEdit({{
+    action: "rename_family", family_id: document.getElementById("family-rename-id").value,
+    name: document.getElementById("family-rename-name").value,
+  }});
+}}
+
+function populateTopicFamily() {{
+  document.getElementById("family-assign-id").value =
+    familyOf(document.getElementById("family-topic-id").value);
+}}
+
+function assignFamily() {{
+  saveTopicEdit({{
+    action: "assign_family", topic_id: document.getElementById("family-topic-id").value,
+    family_id: document.getElementById("family-assign-id").value,
+  }});
 }}
 
 async function saveTopicEdit(edit) {{
@@ -1752,6 +2049,48 @@ function getDateFilter() {{ return localStorage.getItem(STORAGE_KEY_DATEFILTER) 
 
 function setDateFilter(v) {{
   localStorage.setItem(STORAGE_KEY_DATEFILTER, v);
+  localStorage.removeItem(STORAGE_KEY_DATE_RANGE);
+  render();
+}}
+
+function dateFromChartAxis(value) {{
+  const text = typeof value === "number" ? new Date(value).toISOString() : String(value);
+  const match = /^(\\d{{4}}-\\d{{2}})(?:-(\\d{{2}}))?(?:$|[ T])/.exec(text);
+  if (!match) throw new RangeError("Chart zoom requires calendar dates");
+  const date = match[1] + "-" + (match[2] || "01");
+  const parsed = new Date(date + "T00:00:00Z");
+  if (isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== date)
+    throw new RangeError("Chart zoom contains an invalid calendar date");
+  return date;
+}}
+
+function setTrendZoomRange(event) {{
+  const range = event["xaxis.range"] ||
+    (event["xaxis.range[0]"] != null && event["xaxis.range[1]"] != null
+      ? [event["xaxis.range[0]"], event["xaxis.range[1]"]] : null);
+  if (!range) return;
+  if (!Array.isArray(range) || range.length !== 2)
+    throw new RangeError("Chart zoom must provide two dates");
+  let start = dateFromChartAxis(range[0]);
+  let end = dateFromChartAxis(range[1]);
+  if (start > end) throw new RangeError("Chart zoom start must precede its end");
+  const granularity = getTrendGranularity();
+  if (granularity === "week") {{
+    start = trendBucket(start, "week");
+    const sunday = new Date(trendBucket(end, "week") + "T00:00:00Z");
+    sunday.setUTCDate(sunday.getUTCDate() + 6);
+    end = sunday.toISOString().slice(0, 10);
+  }} else if (granularity === "month") {{
+    start = start.slice(0, 7) + "-01";
+    end = new Date(Date.UTC(
+      Number(end.slice(0, 4)), Number(end.slice(5, 7)), 0,
+    )).toISOString().slice(0, 10);
+  }}
+  const stored = JSON.stringify({{ start, end }});
+  if (getDateFilter() === "custom" && localStorage.getItem(STORAGE_KEY_DATE_RANGE) === stored)
+    return;
+  localStorage.setItem(STORAGE_KEY_DATE_RANGE, stored);
+  localStorage.setItem(STORAGE_KEY_DATEFILTER, "custom");
   render();
 }}
 
@@ -1759,6 +2098,16 @@ function getTrendGranularity() {{ return localStorage.getItem(STORAGE_KEY_TREND)
 
 function setTrendGranularity(v) {{
   localStorage.setItem(STORAGE_KEY_TREND, v);
+  render();
+}}
+
+function getTrendMode() {{
+  return localStorage.getItem(STORAGE_KEY_TREND_MODE) === "cumulative" ? "cumulative" : "period";
+}}
+
+function setTrendMode(mode) {{
+  if (mode !== "period" && mode !== "cumulative") throw new Error("Unknown trend mode: " + mode);
+  localStorage.setItem(STORAGE_KEY_TREND_MODE, mode);
   render();
 }}
 
@@ -1778,6 +2127,169 @@ function trendBucket(date, granularity) {{
     return d.toISOString().slice(0, 10);
   }}
   return date;
+}}
+
+let sessionGroupKind = "";
+let sessionGroupValue = "";
+let sessionSearchQuery = "";
+let selectedSessionKey = "";
+let sessionVisibleLimit = 100;
+let sessionBaseRows = [];
+
+function sessionGroupFor(row, kind) {{
+  if (kind === "topic" || kind === "primary_topic") return row.topic_id || "other";
+  if (kind === "effort") return row.reasoning_effort || "n/a";
+  if (kind === "day" || kind === "week" || kind === "month")
+    return row.date ? trendBucket(row.date, kind === "day" ? "day" : kind) : "(undated)";
+  if (kind === "theme" || kind === "mode") {{
+    const theme = HAS_TASKS ? inferTaskTheme(row.task_summary) : "Other";
+    return kind === "mode" ? TASK_THEME_MODE[theme] : theme;
+  }}
+  return row[kind] || "(unknown)";
+}}
+
+function renderSessionExplorer(filtered) {{
+  sessionBaseRows = filtered;
+  document.getElementById("session-group-kind").value = sessionGroupKind;
+  const values = sessionGroupKind
+    ? Array.from(new Set(filtered.flatMap(row => {{
+      if (sessionGroupKind === "topic") return [row.topic_id || "other", ...(row.topic_ids || [])];
+      if (sessionGroupKind === "deliverable")
+        return row.topic_deliverables?.length ? row.topic_deliverables : ["(none)"];
+      return [sessionGroupFor(row, sessionGroupKind)];
+    }})))
+      .sort((a, b) => String(a).localeCompare(String(b)))
+    : [];
+  if (sessionGroupValue && !values.includes(sessionGroupValue)) sessionGroupValue = "";
+  const valueSelect = document.getElementById("session-group-value");
+  valueSelect.hidden = !sessionGroupKind;
+  valueSelect.innerHTML = '<option value="">All groups</option>' +
+    values.map(value => `<option value="${{escapeHtml(value)}}">${{escapeHtml(["topic", "primary_topic"].includes(sessionGroupKind) ? topicName(value) : value)}}</option>`).join("");
+  valueSelect.value = sessionGroupValue;
+  const scoped = sessionGroupValue
+    ? filtered.filter(row => {{
+      if (sessionGroupKind === "topic")
+        return row.topic_id === sessionGroupValue || (row.topic_ids || []).includes(sessionGroupValue);
+      if (sessionGroupKind === "primary_topic")
+        return row.topic_id === sessionGroupValue;
+      if (sessionGroupKind === "deliverable")
+        return sessionGroupValue === "(none)"
+          ? !(row.topic_deliverables || []).length
+          : (row.topic_deliverables || []).includes(sessionGroupValue);
+      return sessionGroupFor(row, sessionGroupKind) === sessionGroupValue;
+    }})
+    : filtered;
+  const sessions = new Map();
+  scoped.forEach((row, index) => {{
+    const identified = typeof row.session_id === "string" && !!row.session_id.trim();
+    const key = identified ? JSON.stringify([row.user, row.session_id]) : "unidentified:" + index;
+    if (!sessions.has(key)) sessions.set(key, {{
+      key, identified, id: identified ? row.session_id : "ID unavailable",
+      user: row.user, projects: new Set(), models: new Set(), dates: new Set(),
+      subjects: new Set(), deliverables: new Set(),
+      topic_id: row.topic_id, summary: row.topic_summary || row.task_summary || "",
+      calls: 0, tokens: 0, cost: 0, rows: [],
+    }});
+    const session = sessions.get(key);
+    session.projects.add(row.project);
+    session.models.add(row.model);
+    for (const id of row.topic_ids || []) session.subjects.add(id);
+    for (const type of row.topic_deliverables || []) session.deliverables.add(type);
+    if (row.date) session.dates.add(row.date);
+    session.calls += row.calls;
+    session.tokens += row.total_tokens;
+    session.cost += row.estimated_cost;
+    session.rows.push(row);
+  }});
+  const query = sessionSearchQuery.trim().toLowerCase();
+  const matches = Array.from(sessions.values()).filter(session =>
+    !query || [session.id, session.user, session.summary, topicName(session.topic_id),
+      ...Array.from(session.subjects).map(topicName), ...session.deliverables,
+      ...session.projects, ...session.models].join(" ").toLowerCase().includes(query)
+  ).sort((a, b) => b.cost - a.cost || a.key.localeCompare(b.key));
+  const shown = matches.slice(0, sessionVisibleLimit);
+  document.getElementById("session-status").textContent =
+    `${{matches.length}} sessions · ${{fmtCurrency(matches.reduce((total, session) => total + session.cost, 0))}} est. cost in this selection`;
+  const table = document.getElementById("session-table");
+  table.innerHTML = shown.map(session => {{
+    const dates = Array.from(session.dates).sort();
+    return `<tr><td>${{session.identified
+      ? `<button class="session-open" data-session-key="${{escapeHtml(session.key)}}">${{escapeHtml(session.id)}}</button>`
+      : "ID unavailable"}}
+      <div class="hint">${{escapeHtml(session.summary)}}</div></td>
+      <td>${{escapeHtml(Array.from(session.projects).join(", "))}}</td>
+      <td>${{TOPICS_ENABLED ? escapeHtml(Array.from(session.subjects).map(topicName).join(", ") || "Other") : "—"}}</td>
+      <td>${{escapeHtml(Array.from(session.deliverables).join(", ") || "—")}}</td>
+      <td>${{escapeHtml(Array.from(session.models).join(", "))}}</td>
+      <td>${{escapeHtml(dates.length ? dates[0] + (dates.length > 1 ? " → " + dates[dates.length - 1] : "") : "—")}}</td>
+      <td>${{fmt(session.calls)}}</td><td>${{fmt(session.tokens)}}</td>
+      <td>${{fmtCurrency(session.cost)}}</td></tr>`;
+  }}).join("") || '<tr><td colspan="9">No matching sessions.</td></tr>';
+  table.querySelectorAll(".session-open").forEach(button =>
+    button.addEventListener("click", () => selectSession(button.dataset.sessionKey))
+  );
+  document.getElementById("session-more").hidden = matches.length <= sessionVisibleLimit;
+
+  const detail = document.getElementById("session-detail");
+  const session = sessions.get(selectedSessionKey);
+  if (!session || (query && !matches.includes(session))) {{
+    detail.innerHTML = selectedSessionKey ? "Selected session is outside the current selection." : "No session selected.";
+    return;
+  }}
+  const coverage = computeCostCoverage(session.rows);
+  const breakdown = [...session.rows].sort((a, b) => b.estimated_cost - a.estimated_cost)
+    .map(row => `<tr><td>${{escapeHtml(row.date || "—")}}</td><td>${{escapeHtml(row.model)}}</td>
+      <td>${{escapeHtml(row.reasoning_effort || "n/a")}}</td><td>${{fmt(row.calls)}}</td>
+      <td>${{row.input_tokens == null ? "—" : fmt(row.input_tokens)}}</td>
+      <td>${{row.output_tokens == null ? "—" : fmt(row.output_tokens)}}</td>
+      <td>${{row.cache_read_tokens == null ? "—" : fmt(row.cache_read_tokens)}}</td>
+      <td>${{row.cache_write_tokens == null ? "—" : fmt(row.cache_write_tokens)}}</td>
+      <td>${{row.reasoning_tokens == null ? "—" : fmt(row.reasoning_tokens)}}</td>
+      <td>${{fmtCurrency(row.estimated_cost)}}</td></tr>`).join("");
+  detail.innerHTML = `<h3>Session ${{escapeHtml(session.id)}}</h3>
+    <p>${{escapeHtml(session.summary)}}</p>
+    <p><b>Subjects:</b> ${{escapeHtml(Array.from(session.subjects).map(topicName).join(", ") || "Other")}} ·
+      <b>Deliverables:</b> ${{escapeHtml(Array.from(session.deliverables).join(", ") || "none")}}</p>
+    <p><b>Filtered scope:</b> ${{fmt(session.tokens)}} input + output tokens ·
+      ${{fmt(session.calls)}} calls · ${{fmtCurrency(session.cost)}} estimated cost.
+      Cost coverage: ${{fmt(coverage.confirmedCalls)}} of ${{fmt(session.calls)}} calls confirmed
+      (${{fmt(coverage.missingKnownCalls)}} missing, ${{fmt(coverage.unknownCalls)}} unknown).
+      ${{coverage.isComplete ? "" : "Incomplete coverage may understate actual cost."}}</p>
+    <div style="overflow-x:auto"><table><thead><tr><th>Day</th><th>Model</th><th>Effort</th>
+      <th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th>
+      <th>Cache write</th><th>Reasoning</th><th>Est. cost</th></tr></thead>
+      <tbody>${{breakdown}}</tbody></table></div>`;
+}}
+
+function setSessionGroup(kind, value) {{
+  sessionGroupKind = kind;
+  sessionGroupValue = value;
+  sessionVisibleLimit = 100;
+  renderSessionExplorer(sessionBaseRows);
+}}
+
+function drillToSessions(kind, value) {{
+  sessionSearchQuery = "";
+  document.getElementById("session-search").value = "";
+  setSessionGroup(kind, value);
+  const section = document.getElementById("sec-sessions");
+  if (section.scrollIntoView) section.scrollIntoView({{ behavior: "smooth" }});
+}}
+
+function searchSessions(value) {{
+  sessionSearchQuery = value;
+  sessionVisibleLimit = 100;
+  renderSessionExplorer(sessionBaseRows);
+}}
+
+function showMoreSessions() {{
+  sessionVisibleLimit += 100;
+  renderSessionExplorer(sessionBaseRows);
+}}
+
+function selectSession(key) {{
+  selectedSessionKey = key;
+  renderSessionExplorer(sessionBaseRows);
 }}
 
 let taskTableRows = [];
@@ -1991,6 +2503,31 @@ function computeCutoffDate(dateFilter) {{
 
 const chartLayouts = new Map();
 let chartRevision = 0;
+function bindSessionChart(id, element) {{
+  if (typeof element.on !== "function" || element.__sessionClickBound) return;
+  const chartGroups = {{
+    fig_project: ["project", "y"], fig_model: ["model", "y"],
+    fig_provider: ["provider", "label"], fig_topic: ["primary_topic", "customdata"],
+    fig_work_mode: ["mode", "label"], fig_effort: ["effort", "x"],
+    fig_user: ["user", "x"], fig_theme_model: ["theme", "y"],
+  }};
+  if (!chartGroups[id] && id !== "fig_trend" && id !== "fig_theme_time") return;
+  element.on("plotly_click", event => {{
+    const point = event.points && event.points[0];
+    if (!point) return;
+    const [kind, field] = chartGroups[id] || [getTrendGranularity(), "x"];
+    const value = point[field];
+    if (value != null && value !== "") drillToSessions(kind, String(value));
+  }});
+  if (id === "fig_trend") {{
+    element.on("plotly_relayout", setTrendZoomRange);
+    element.on("plotly_doubleclick", () => {{
+      if (getDateFilter() === "custom") setDateFilter("all");
+    }});
+  }}
+  element.__sessionClickBound = true;
+}}
+
 function drawChart(id, traces, layout, config) {{
   // Plotly keeps zoom and pie-legend state until the selected data changes.
   layout = {{ ...layout, uirevision: chartRevision }};
@@ -2026,12 +2563,16 @@ function drawChart(id, traces, layout, config) {{
     }}
   }}
   const legend = {{ orientation: "h", x: 0, y: -0.3, ...layout.legend }};
-  return Plotly.react(id, traces, {{
+  const result = Plotly.react(id, traces, {{
     ...layout, title, margin, xaxis, yaxis, legend,
     autosize: true, width: element.clientWidth,
     font: {{ family: "Segoe UI, sans-serif", size: 12, color: "#374151" }},
     paper_bgcolor: "#ffffff", plot_bgcolor: "#ffffff",
   }}, config);
+  if (result && typeof result.then === "function")
+    result.then(() => bindSessionChart(id, element));
+  else bindSessionChart(id, element);
+  return result;
 }}
 
 function render() {{
@@ -2039,18 +2580,107 @@ function render() {{
   const excludedProjects = loadExcluded("project");
   const excludedModels = loadExcluded("model");
   const excludedProviders = loadExcluded("provider");
-  let topicFilter = TOPICS_ENABLED ? (localStorage.getItem(STORAGE_KEY_TOPIC) || "") : "";
+  let topicFilters = TOPICS_ENABLED ? loadFacetFilters(STORAGE_KEY_TOPIC) : [];
+  let familyFilters = TOPICS_ENABLED ? loadFacetFilters(STORAGE_KEY_FAMILY) : [];
+  let deliverableFilters = TOPICS_ENABLED ? loadFacetFilters(STORAGE_KEY_DELIVERABLE) : [];
+  const dateFilter = getDateFilter();
+  const zoomRange = dateFilter === "custom"
+    ? JSON.parse(localStorage.getItem(STORAGE_KEY_DATE_RANGE)) : null;
+  if (dateFilter === "custom" && (!zoomRange || !/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(zoomRange.start)
+      || !/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(zoomRange.end) || zoomRange.start > zoomRange.end))
+    throw new RangeError("Invalid saved chart zoom range");
+  const cutoffDateStr = zoomRange ? zoomRange.start : computeCutoffDate(dateFilter);
+  const endDateStr = zoomRange ? zoomRange.end : null;
   if (TOPICS_ENABLED) {{
-    const ids = new Set(RAW.map(r => r.topic_id));
-    if (topicFilter && !ids.has(topicFilter)) {{
-      topicFilter = "";
-      localStorage.removeItem(STORAGE_KEY_TOPIC);
+    const baseRows = RAW.filter(r =>
+      !excludedProjects.has(r.project) && !excludedModels.has(r.model)
+      && !excludedProviders.has(r.provider)
+      && (!cutoffDateStr || (r.date && r.date >= cutoffDateStr))
+      && (!endDateStr || (r.date && r.date <= endDateStr)));
+    const baseDeliverables = new Set(baseRows
+      .filter(r => rowInFamily(r, familyFilters))
+      .flatMap(r => r.topic_deliverables || []));
+    const retainedDeliverables = deliverableFilters.filter(id => baseDeliverables.has(id));
+    const removedDeliverables = deliverableFilters.length - retainedDeliverables.length;
+    deliverableFilters = retainedDeliverables;
+    if (removedDeliverables) saveFacetFilters(STORAGE_KEY_DELIVERABLE, deliverableFilters);
+    const deliverableRows = deliverableFilters.length
+      ? baseRows.filter(r => deliverableFilters.some(id => (r.topic_deliverables || []).includes(id)))
+      : baseRows;
+    const countsFor = (rows, getIds) => {{
+      const counts = new Map();
+      rows.forEach((row, index) => {{
+        const session = row.session_id
+          ? JSON.stringify([row.user, row.session_id]) : `unidentified:${{index}}`;
+        for (const id of new Set(getIds(row))) {{
+          if (!counts.has(id)) counts.set(id, new Set());
+          counts.get(id).add(session);
+        }}
+      }});
+      return counts;
+    }};
+    const baseFamilyCounts = countsFor(deliverableRows, r => [...rowTopics(r)].map(familyOf));
+    const retainedFamilies = familyFilters.filter(id => baseFamilyCounts.has(id));
+    let removedFamilies = familyFilters.length - retainedFamilies.length;
+    familyFilters = retainedFamilies;
+    if (removedFamilies) saveFacetFilters(STORAGE_KEY_FAMILY, familyFilters);
+    const topicCountsFor = () => countsFor(
+      deliverableRows.filter(r => rowInFamily(r, familyFilters)),
+      r => [...rowTopics(r)].filter(id =>
+        !familyFilters.length || familyFilters.includes(familyOf(id))),
+    );
+    let topicCounts = topicCountsFor();
+    const retainedTopics = topicFilters.filter(id => topicCounts.has(id));
+    const removedTopics = topicFilters.length - retainedTopics.length;
+    topicFilters = retainedTopics;
+    if (removedTopics) {{
+      console.warn("Removing saved topic selections not present in this dashboard");
+      saveFacetFilters(STORAGE_KEY_TOPIC, topicFilters);
     }}
+    const familyCounts = countsFor(deliverableRows, r =>
+      [...rowTopics(r)].filter(id => !topicFilters.length || topicFilters.includes(id))
+        .map(familyOf));
+    const availableFamilies = familyFilters.filter(id => familyCounts.has(id));
+    removedFamilies += familyFilters.length - availableFamilies.length;
+    familyFilters = availableFamilies;
+    if (removedFamilies) saveFacetFilters(STORAGE_KEY_FAMILY, familyFilters);
+    topicCounts = topicCountsFor();
+    const familySelect = document.getElementById("family-filter");
+    const familyNames = new Map([
+      ["uncategorized", "Uncategorized"],
+      ...(TOPIC_CATALOG.families || []).map(family => [family.id, family.name]),
+    ]);
+    familySelect.innerHTML = Array.from(familyCounts).sort(([a], [b]) =>
+      familyNames.get(a).localeCompare(familyNames.get(b)))
+      .map(([id, sessions]) => `<option value="${{escapeHtml(id)}}">${{escapeHtml(familyNames.get(id))}} (${{sessions.size}})</option>`).join("");
+    familySelect.querySelectorAll("option").forEach(option => {{
+      option.selected = familyFilters.includes(option.value);
+    }});
+    document.getElementById("family-selection-summary").textContent =
+      removedFamilies ? `${{removedFamilies}} selection(s) cleared: no match for current filters`
+      : familyFilters.length ? `${{familyFilters.length}} selected` : "All families";
     const select = document.getElementById("topic-filter");
-    select.innerHTML = '<option value="">All topics</option>' +
-      Array.from(ids).sort((a, b) => topicName(a).localeCompare(topicName(b)))
-        .map(id => `<option value="${{escapeHtml(id)}}">${{escapeHtml(topicName(id))}}</option>`).join("");
-    select.value = topicFilter;
+    select.innerHTML = Array.from(topicCounts).sort(([a], [b]) => topicName(a).localeCompare(topicName(b)))
+      .map(([id, sessions]) => `<option value="${{escapeHtml(id)}}">${{escapeHtml(topicName(id))}} (${{sessions.size}})</option>`).join("");
+    select.querySelectorAll("option").forEach(option => {{
+      option.selected = topicFilters.includes(option.value);
+    }});
+    document.getElementById("topic-selection-summary").textContent =
+      removedTopics ? `${{removedTopics}} selection(s) cleared: no match for current filters`
+      : topicFilters.length ? `${{topicFilters.length}} selected` : "All topics";
+    const deliverables = Array.from(new Set(baseRows
+      .filter(r => rowInFamily(r, familyFilters))
+      .filter(r => !topicFilters.length || topicFilters.some(id => rowTopics(r).has(id)))
+      .flatMap(r => r.topic_deliverables || []))).sort();
+    const deliverableSelect = document.getElementById("deliverable-filter");
+    deliverableSelect.innerHTML = deliverables
+      .map(value => `<option value="${{escapeHtml(value)}}">${{escapeHtml(value)}}</option>`).join("");
+    deliverableSelect.querySelectorAll("option").forEach(option => {{
+      option.selected = deliverableFilters.includes(option.value);
+    }});
+    document.getElementById("deliverable-selection-summary").textContent =
+      removedDeliverables ? `${{removedDeliverables}} selection(s) cleared: no match for current filters`
+      : deliverableFilters.length ? `${{deliverableFilters.length}} selected` : "All deliverables";
   }}
   document.querySelectorAll(".proj-check").forEach(cb => {{ cb.checked = !excludedProjects.has(cb.value); }});
   document.querySelectorAll(".model-check").forEach(cb => {{ cb.checked = !excludedModels.has(cb.value); }});
@@ -2068,8 +2698,6 @@ function render() {{
   setPressed(document.getElementById("metric-tokens"), metric === "tokens");
   setPressed(document.getElementById("metric-cost"), metric === "cost");
 
-  const dateFilter = getDateFilter();
-  const cutoffDateStr = computeCutoffDate(dateFilter);
   ["7", "14", "30", "90", "all"].forEach(v => {{
     const btn = document.getElementById("date-" + v);
     if (btn) setPressed(btn, dateFilter === v);
@@ -2078,23 +2706,32 @@ function render() {{
   if (dateHintEl) {{
     dateHintEl.textContent = dateFilter === "all"
       ? "All exported dates"
+      : zoomRange ? `${{zoomRange.start}} \u2192 ${{zoomRange.end}} (chart zoom; All time resets)`
       : ((cutoffDateStr || "?") + " \u2192 " + (GLOBAL_MAX_DATE || "?") + " (relative to latest export date)");
   }}
 
   // Single choke point for every project/model/provider/date filter - every
   // KPI, chart, insight, trend, value-for-money, work-pattern view, task
   // table, and composition chart below reads exclusively from `filtered`
-  // (never RAW directly), and each condition here is independent (AND, not
-  // OR): a row must pass ALL FOUR to be included. In particular, a model
+  // (never RAW directly), and each dimension is independent (AND between
+  // dimensions, OR among selected topics). In particular, a model
   // whose own checkbox is still checked is still excluded if its inferred
   // provider is unchecked - see the Provider panel's hint text.
-  const filtered = RAW.filter(r => !excludedProjects.has(r.project) && !excludedModels.has(r.model) && !excludedProviders.has(r.provider) && (!cutoffDateStr || (r.date && r.date >= cutoffDateStr)) && (!topicFilter || r.topic_id === topicFilter));
+  const filtered = RAW.filter(r => !excludedProjects.has(r.project) && !excludedModels.has(r.model) && !excludedProviders.has(r.provider) && (!cutoffDateStr || (r.date && r.date >= cutoffDateStr)) && (!endDateStr || (r.date && r.date <= endDateStr)) && rowInFamily(r, familyFilters) && (!topicFilters.length || topicFilters.some(id => rowTopics(r).has(id))) && (!deliverableFilters.length || deliverableFilters.some(id => (r.topic_deliverables || []).includes(id))));
   if (TOPICS_ENABLED) renderTopics(filtered, valKey, fmtVal);
+  renderSessionExplorer(filtered);
 
   // KPIs (always show both tokens and cost, regardless of chart metric toggle)
   const totalTokens = sum(filtered, "total_tokens");
   const totalCost = sum(filtered, "estimated_cost");
   const totalCalls = sum(filtered, "calls");
+  const identifiedSessions = new Set();
+  let unidentifiedRows = 0;
+  for (const row of filtered) {{
+    if (typeof row.session_id === "string" && row.session_id.trim())
+      identifiedSessions.add(JSON.stringify([row.user, row.session_id]));
+    else unidentifiedRows += 1;
+  }}
   const coverage = computeCostCoverage(filtered);
   const coverageLabel = totalCalls > 0 ? Math.round(coverage.pctConfirmed) + "%" : "n/a";
   const coverageWarn = totalCalls > 0 && !coverage.isComplete;
@@ -2127,6 +2764,12 @@ function render() {{
     <div class="kpi">
       <div class="kpi-label">Model calls</div><div class="kpi-value">${{fmt(totalCalls)}}</div>
       <div class="kpi-note">API calls in the current selection</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Sessions</div><div class="kpi-value">${{fmt(identifiedSessions.size)}}</div>
+      <div class="kpi-note">Identified sessions in the current selection${{unidentifiedRows
+        ? `; ${{fmt(unidentifiedRows)}} rows without session IDs excluded.`
+        : "."}}</div>
     </div>
   `;
 
@@ -2225,22 +2868,48 @@ function render() {{
 
   // Trend over time
   const granularity = getTrendGranularity();
+  const trendMode = getTrendMode();
   updateTrendGranularityButtons(granularity);
+  setPressed(document.getElementById("trend-period"), trendMode === "period");
+  setPressed(document.getElementById("trend-cumulative"), trendMode === "cumulative");
   const trendUnit = granularity === "day" ? "day" : granularity === "week" ? "week" : "month";
   const byDate = groupSum(filtered, r => trendBucket(r.date, granularity), valKey);
   const dateEntries = Array.from(byDate.entries()).sort((a, b) => a[0] < b[0] ? -1 : 1);
-  const trendTitle = metric === "cost" ? "Estimated Cost Over Time" : "Token Usage Over Time";
+  const plottedDates = [];
+  if (trendMode === "cumulative" && dates.length) {{
+    const first = trendBucket(cutoffDateStr || dates[0], granularity);
+    const last = trendBucket(endDateStr || (cutoffDateStr ? GLOBAL_MAX_DATE : dates[dates.length - 1]), granularity);
+    const cursor = new Date((granularity === "month" ? first + "-01" : first) + "T00:00:00Z");
+    const end = new Date((granularity === "month" ? last + "-01" : last) + "T00:00:00Z");
+    let running = 0;
+    while (cursor <= end) {{
+      const bucket = cursor.toISOString().slice(0, granularity === "month" ? 7 : 10);
+      const periodValue = byDate.get(bucket) || 0;
+      running += periodValue;
+      plottedDates.push([bucket, running, periodValue]);
+      if (granularity === "month") cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+      else cursor.setUTCDate(cursor.getUTCDate() + (granularity === "week" ? 7 : 1));
+    }}
+  }} else {{
+    plottedDates.push(...dateEntries.map(([bucket, value]) => [bucket, value, value]));
+  }}
+  const trendTitle = (trendMode === "cumulative" ? "Cumulative " : "") +
+    (metric === "cost" ? "Estimated Cost Over Time" : "Token Usage Over Time");
   const trendAxisTitle = granularity === "day"
     ? "Date (calendar day)"
     : granularity === "week" ? "Week starting (Monday)" : "Month (calendar)";
   const peakValue = dateEntries.reduce((peak, d) => Math.max(peak, d[1]), 0);
   drawChart("fig_trend", [{{
-    x: dateEntries.map(d => d[0]), y: dateEntries.map(d => d[1]), type: "scatter", mode: "lines+markers+text",
+    x: plottedDates.map(d => d[0]), y: plottedDates.map(d => d[1]),
+    customdata: plottedDates.map(d => d[2]), type: "scatter", mode: "lines+markers+text",
     line: {{ color: OKABE_ITO.blue, width: 2.5 }}, marker: {{ size: 6 }}, fill: "tozeroy", fillcolor: "rgba(0,114,178,0.10)",
-    text: dateEntries.map((d, i) => i === dateEntries.length - 1 || d[1] === peakValue ? fmtVal(d[1]) : ""),
-    textposition: dateEntries.map((d, i) => i === dateEntries.length - 1 ? "top left" : "top center"),
+    text: plottedDates.map((d, i) => i === plottedDates.length - 1 || (trendMode === "period" && d[1] === peakValue) ? fmtVal(d[1]) : ""),
+    textposition: plottedDates.map((d, i) => i === plottedDates.length - 1 ? "top left" : "top center"),
     cliponaxis: false,
-    hovertemplate: "%{{x}}: %{{y:,}} " + unitLabel + "<extra></extra>",
+    hovertemplate: trendMode === "cumulative"
+      ? "%{{x}}<br>Period: " + (metric === "cost" ? "$%{{customdata:,.2f}}" : "%{{customdata:,}} tokens") +
+        "<br>Cumulative: " + (metric === "cost" ? "$%{{y:,.2f}}" : "%{{y:,}} tokens") + "<extra></extra>"
+      : "%{{x}}: %{{y:,}} " + unitLabel + "<extra></extra>",
   }}], {{ title: {{ text: trendTitle + " (by " + trendUnit + ")" }}, xaxis: {{ title: {{ text: trendAxisTitle }} }}, yaxis: {{ title: {{ text: valAxisTitle }} }} }}, {{ responsive: true }});
 
   // Trend insight: flag the single biggest period-over-period jump, if any
@@ -2501,9 +3170,10 @@ function render() {{
   if (HAS_TASKS) {{
     const byTask = new Map();
     for (const r of filtered) {{
-      if (!r.task_summary) continue;
-      const k = r.project + "||" + r.task_summary + "||" + (r.session_id || "");
-      if (!byTask.has(k)) byTask.set(k, {{ project: r.project, task: r.task_summary, topic_id: r.topic_id, tokens: 0, cost: 0 }});
+      const task = r.topic_summary || r.task_summary;
+      if (!task) continue;
+      const k = r.project + "||" + task + "||" + (r.session_id || "");
+      if (!byTask.has(k)) byTask.set(k, {{ project: r.project, task, topic_id: r.topic_id, tokens: 0, cost: 0 }});
       const t = byTask.get(k);
       t.tokens += r.total_tokens;
       t.cost += r.estimated_cost;
@@ -2564,6 +3234,22 @@ document.addEventListener("change", (e) => {{
     saveTopicEdit({{
       action: "override", user: e.target.dataset.user,
       session_id: e.target.dataset.sessionId, topic_id: e.target.value,
+    }});
+    return;
+  }}
+  if (e.target.classList.contains("topic-tags-override")) {{
+    saveTopicEdit({{
+      action: "override_tags", user: e.target.dataset.user,
+      session_id: e.target.dataset.sessionId,
+      topic_ids: Array.from(e.target.selectedOptions, option => option.value),
+    }});
+    return;
+  }}
+  if (e.target.classList.contains("deliverables-override")) {{
+    saveTopicEdit({{
+      action: "override_deliverables", user: e.target.dataset.user,
+      session_id: e.target.dataset.sessionId,
+      deliverables: Array.from(e.target.selectedOptions, option => option.value),
     }});
     return;
   }}

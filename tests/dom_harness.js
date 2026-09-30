@@ -73,9 +73,11 @@ function makeFakeEl(id) {
     hidden: false,
     disabled: false,
     attributes: {},
+    plotlyHandlers: {},
     clientWidth: 900,
     setAttribute(name, value) { this.attributes[name] = String(value); },
     addEventListener() {},
+    on(event, handler) { this.plotlyHandlers[event] = handler; },
     focus() {},
     setSelectionRange() {},
     querySelectorAll() { return []; },
@@ -168,9 +170,20 @@ vm.createContext(sandbox);
 // `sandbox.RAW` would otherwise be undefined outside the script.
 const mainScriptWithTestHook = mainScript + "\nwindow.__RAW_FOR_TESTS = (typeof RAW !== 'undefined') ? RAW : null;\n";
 vm.runInContext(mainScriptWithTestHook, sandbox, { filename: "dashboard-inline.js" });
-const allowedActions = new Set(["searchFilters", "showMoreFilters", "selectOnly", "resetFilters", "setAll", "setMetric", "setTopicFilter", "setDateFilter", "setTrendGranularity", "toggleSidebar"]);
+const allowedActions = new Set(["searchFilters", "showMoreFilters", "selectOnly", "resetFilters", "setAll", "setMetric", "setTopicFilter", "setFamilyFilter", "setDeliverableFilter", "setDateFilter", "setTrendGranularity", "setTrendMode", "toggleSidebar", "selectSession", "setSessionGroup", "searchSessions", "showMoreSessions", "drillToSessions", "clickChart", "zoomChart", "resetChartZoom", "applyTopicCatalog"]);
 for (const action of JSON.parse(process.argv[4] || "[]")) {
   if (!allowedActions.has(action.name)) throw new Error("Unsupported harness action: " + action.name);
+  if (action.name === "clickChart") {
+    const [id, point] = action.args;
+    documentStub.getElementById(id).plotlyHandlers.plotly_click({ points: [point] });
+    continue;
+  }
+  if (action.name === "zoomChart" || action.name === "resetChartZoom") {
+    const [id, range] = action.args;
+    const eventName = action.name === "zoomChart" ? "plotly_relayout" : "plotly_doubleclick";
+    documentStub.getElementById(id).plotlyHandlers[eventName](range || {});
+    continue;
+  }
   sandbox[action.name](...(action.args || []));
 }
 
