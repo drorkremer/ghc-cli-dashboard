@@ -4,6 +4,8 @@
 import json
 import math
 import os
+import sqlite3
+from contextlib import contextmanager
 import re
 import tempfile
 import uuid
@@ -14,12 +16,16 @@ import numpy as np
 
 
 OTHER = "other"
+UNCATEGORIZED = "uncategorized"
 MODEL = "BAAI/bge-small-en-v1.5"
+DELIVERABLE_TYPES = {"code", "deck", "doc", "info", "data", "config", "other"}
 STOPWORDS = set(
     "a an and are as at be by for from in into is it of on or the this to with "
     "about after before can how what why your my please session sessions copilot "
     "cli task tasks project repo repository file files using use implement help "
-    "bootstrap watcher".split()
+    "bootstrap watcher audit auditing verify verification verified final current "
+    "expanded specific review reviewing optimization substantive work topic "
+    "architecture".split()
 )
 
 
@@ -28,7 +34,11 @@ def session_key(user, session_id):
 
 
 def empty_catalog():
-    return {"version": 1, "topics": [], "assignments": {}, "overrides": {}}
+    return {
+        "version": 1, "topics": [], "assignments": {}, "overrides": {},
+        "tag_overrides": {}, "deliverable_overrides": {},
+        "families": [], "family_assignments": {}, "family_overrides": {},
+    }
 
 
 def validate_catalog(catalog):
@@ -55,6 +65,30 @@ def validate_catalog(catalog):
                 for value in values
             ):
                 raise ValueError(f"invalid topic {field}")
+    families = catalog.get("families", [])
+    if not isinstance(families, list):
+        raise ValueError("invalid topic families")
+    family_ids = {UNCATEGORIZED}
+    family_names = set()
+    for family in families:
+        if (not isinstance(family, dict) or not isinstance(family.get("id"), str)
+                or not family["id"] or family["id"] in family_ids
+                or not isinstance(family.get("name"), str)
+                or not family["name"].strip() or len(family["name"]) > 120
+                or family["name"].strip().casefold() in family_names
+                or family["name"].strip().casefold() == "uncategorized"):
+            raise ValueError("invalid topic family")
+        family_ids.add(family["id"])
+        family_names.add(family["name"].casefold())
+    for field in ("family_assignments", "family_overrides"):
+        values = catalog.get(field, {})
+        if not isinstance(values, dict) or any(
+            not isinstance(topic_id, str) or topic_id not in ids
+            or topic_id == OTHER or not isinstance(family_id, str)
+            or family_id not in family_ids
+            for topic_id, family_id in values.items()
+        ):
+            raise ValueError(f"invalid topic {field}")
     for field in ("assignments", "overrides"):
         values = catalog.get(field)
         if not isinstance(values, dict) or any(
@@ -62,6 +96,34 @@ def validate_catalog(catalog):
             for key, value in values.items()
         ):
             raise ValueError(f"invalid topic {field}")
+    tag_overrides = catalog.get("tag_overrides", {})
+    if not isinstance(tag_overrides, dict) or any(
+        not isinstance(key, str) or not isinstance(values, list) or len(values) > 2
+        or any(not isinstance(value, str) or value == OTHER or value not in ids for value in values)
+        or len(set(values)) != len(values)
+        for key, values in tag_overrides.items()
+    ):
+        raise ValueError("invalid topic tag_overrides")
+    deliverable_overrides = catalog.get("deliverable_overrides", {})
+    if not isinstance(deliverable_overrides, dict) or any(
+        not isinstance(key, str) or not isinstance(values, list) or len(values) > len(DELIVERABLE_TYPES)
+        or any(not isinstance(value, str) or value not in DELIVERABLE_TYPES for value in values)
+        or len(set(values)) != len(values)
+        for key, values in deliverable_overrides.items()
+    ):
+        raise ValueError("invalid topic deliverable_overrides")
+
+
+@contextmanager
+def catalog_lock(path):
+    lock_path = Path(f"{path}.lock.sqlite3")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(lock_path, timeout=300) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        finally:
+            connection.rollback()
 
 
 def load_catalog(path):
@@ -146,7 +208,44 @@ def apply_edit(catalog, edit):
             for key, value in catalog[field].items():
                 if value == source:
                     catalog[field][key] = target
+        for key, values in catalog.get("tag_overrides", {}).items():
+            catalog["tag_overrides"][key] = list(dict.fromkeys(
+                target if value == source else value for value in values
+            ))
+        for field in ("family_assignments", "family_overrides"):
+            mapping = catalog.setdefault(field, {})
+            if target not in mapping and source in mapping:
+                mapping[target] = mapping[source]
+            mapping.pop(source, None)
         topics.remove(by_id[source])
+    elif action == "create_family":
+        name = edit.get("name")
+        if (not isinstance(name, str) or not name.strip() or len(name) > 120
+                or name.strip().casefold() == "uncategorized"
+                or any(f["name"].casefold() == name.strip().casefold()
+                       for f in catalog.get("families", []))):
+            raise ValueError("invalid family name")
+        catalog.setdefault("families", []).append({"id": uuid.uuid4().hex, "name": name.strip()})
+    elif action == "rename_family":
+        family = next((f for f in catalog.get("families", [])
+                       if f["id"] == edit.get("family_id")), None)
+        name = edit.get("name")
+        if (family is None or not isinstance(name, str) or not name.strip()
+                or len(name) > 120
+                or name.strip().casefold() == "uncategorized"
+                or any(f["id"] != family["id"] and f["name"].casefold() == name.strip().casefold()
+                       for f in catalog["families"])):
+            raise ValueError("invalid family rename")
+        family["name"] = name.strip()
+    elif action == "assign_family":
+        topic_id, family_id = edit.get("topic_id"), edit.get("family_id")
+        if not isinstance(topic_id, str) or topic_id not in by_id:
+            raise ValueError("unknown topic")
+        if not isinstance(family_id, str) or family_id not in {
+            UNCATEGORIZED, *(family["id"] for family in catalog.get("families", []))
+        }:
+            raise ValueError("unknown family")
+        catalog.setdefault("family_overrides", {})[topic_id] = family_id
     elif action == "override":
         user, session_id, topic_id = (edit.get(key) for key in ("user", "session_id", "topic_id"))
         if not isinstance(user, str) or not user or not isinstance(session_id, str) or not session_id:
@@ -154,9 +253,49 @@ def apply_edit(catalog, edit):
         if not isinstance(topic_id, str) or (topic_id not in by_id and topic_id != OTHER):
             raise ValueError("unknown topic")
         catalog["overrides"][session_key(user, session_id)] = topic_id
+    elif action == "override_tags":
+        user, session_id, topic_ids = (edit.get(key) for key in ("user", "session_id", "topic_ids"))
+        if not isinstance(user, str) or not user or not isinstance(session_id, str) or not session_id:
+            raise ValueError("invalid session identity")
+        if (not isinstance(topic_ids, list) or len(topic_ids) > 2
+                or any(not isinstance(topic_id, str) or topic_id not in by_id for topic_id in topic_ids)
+                or len(set(topic_ids)) != len(topic_ids)):
+            raise ValueError("invalid additional subject topics")
+        catalog.setdefault("tag_overrides", {})[session_key(user, session_id)] = topic_ids
+    elif action == "override_deliverables":
+        user, session_id, deliverables = (edit.get(key) for key in ("user", "session_id", "deliverables"))
+        if not isinstance(user, str) or not user or not isinstance(session_id, str) or not session_id:
+            raise ValueError("invalid session identity")
+        if (not isinstance(deliverables, list) or len(deliverables) > len(DELIVERABLE_TYPES)
+                or any(not isinstance(value, str) or value not in DELIVERABLE_TYPES
+                       for value in deliverables)
+                or len(set(deliverables)) != len(deliverables)):
+            raise ValueError("invalid deliverable types")
+        catalog.setdefault("deliverable_overrides", {})[session_key(user, session_id)] = deliverables
     else:
         raise ValueError("unknown topic edit action")
     validate_catalog(catalog)
+    return catalog
+
+
+def assign_family_batch(catalog, topic_ids, family_ids):
+    """Record validated model suggestions without replacing explicit corrections."""
+    validate_catalog(catalog)
+    known_topics = {topic["id"] for topic in catalog["topics"]}
+    known_families = {UNCATEGORIZED, *(family["id"] for family in catalog.get("families", []))}
+    if (not isinstance(topic_ids, list) or not isinstance(family_ids, list)
+            or len(topic_ids) != len(family_ids) or len(set(topic_ids)) != len(topic_ids)
+            or any(not isinstance(topic_id, str) or topic_id not in known_topics
+                   for topic_id in topic_ids)):
+        raise ValueError("invalid family model response: unexpected topics")
+    if any(not isinstance(family_id, str) or family_id not in known_families
+           for family_id in family_ids):
+        raise ValueError("unknown family in model response")
+    assignments = catalog.setdefault("family_assignments", {})
+    overrides = catalog.get("family_overrides", {})
+    for topic_id, family_id in zip(topic_ids, family_ids):
+        if topic_id not in overrides:
+            assignments[topic_id] = family_id
     return catalog
 
 
@@ -181,21 +320,65 @@ def _cosine(left, right):
     return numerator / magnitude if magnitude else 0.0
 
 
+def _anchor_tokens(text):
+    return {
+        word.casefold() for word in re.findall(r"[^\W_]+", text, re.UNICODE)
+        if len(word) > 2 and not word.isdigit() and word.casefold() not in STOPWORDS
+    }
+
+
+def _uninformative_summary(text):
+    text = text.strip()
+    return (
+        text.casefold().rstrip(".!?") == "unknown"
+        or bool(re.match(r"first read the cairn protocol context at\s", text, re.IGNORECASE))
+        or (text.startswith("`") and text.endswith("`")
+            and not any(char.isspace() for char in text[1:-1]))
+    )
+
+
 def _label(texts):
-    terms = [
-        {word.casefold() for word in re.findall(r"[^\W_]+", text, re.UNICODE)
-         if len(word) > 2 and not word.isdigit() and word.casefold() not in STOPWORDS}
-        for text in texts
-    ]
+    terms = [_anchor_tokens(text) for text in texts]
     counts = Counter(word for term_set in terms for word in term_set)
     common = [word for word, count in counts.items() if count > 1]
     if common:
+        if len(common) > 1:
+            shared = set(common)
+            label = []
+            seen = set()
+            for word in re.findall(r"[^\W_]+", texts[0]):
+                normalized = word.casefold()
+                if normalized in shared and normalized not in seen:
+                    label.append(word)
+                    seen.add(normalized)
+                    if len(label) == 4:
+                        break
+            if len(label) > 1:
+                return " ".join(label)[:120]
         best = sorted(common, key=lambda word: (-counts[word], word))[0]
         return next(word for word in re.findall(r"[^\W_]+", texts[0]) if word.casefold() == best)[:120]
     return (texts[0].splitlines()[0][:60].strip() or "Unclassified topic")
 
 
-def classify(sessions, path, encoder=None):
+def _unique_auto_name(texts, used_names):
+    def key(name):
+        return re.sub(r"[^\w]+", " ", name.casefold()).strip()
+
+    label = _label(texts)
+    candidates = [label, *(text.splitlines()[0][:60].strip() for text in texts)]
+    for candidate in candidates:
+        if candidate and key(candidate) not in used_names:
+            used_names.add(key(candidate))
+            return candidate
+    number = 2
+    while key(f"{label[:110]} ({number})") in used_names:
+        number += 1
+    name = f"{label[:110]} ({number})"
+    used_names.add(key(name))
+    return name
+
+
+def _classify_locked(sessions, path, encoder=None):
     """Return session-key -> topic ID, preserving earlier decisions across builds.
 
     sessions contains (user, session_id, summary) tuples. Classification is
@@ -215,7 +398,10 @@ def classify(sessions, path, encoder=None):
         elif key in catalog["assignments"]:
             assignments[key] = catalog["assignments"][key]
         elif isinstance(summary, str) and summary.strip():
-            pending[key] = summary.strip()[:500].strip()
+            if _uninformative_summary(summary):
+                assignments[key] = OTHER
+            else:
+                pending[key] = summary.strip()[:500].strip()
         else:
             assignments[key] = OTHER
 
@@ -238,14 +424,16 @@ def classify(sessions, path, encoder=None):
             raise ValueError("embedding model returned an unexpected number of vectors")
         topic_kinds = {topic["id"]: topic["kind"] for topic in catalog["topics"]}
         prior = [
-            (topic_id, vector, topic_kinds[topic_id])
-            for (topic_id, _), vector in zip(examples, vectors[len(keys):])
+            (topic_id, vector, topic_kinds[topic_id], _anchor_tokens(example))
+            for (topic_id, example), vector in zip(examples, vectors[len(keys):])
         ]
         unassigned = []
         for key, vector in zip(keys, vectors[:len(keys)]):
+            anchors = _anchor_tokens(pending[key])
             for kind in ("user", "auto"):
                 match = max(
-                    (item for item in prior if item[2] == kind),
+                    (item for item in prior if item[2] == kind
+                     and (kind == "user" or anchors & item[3])),
                     key=lambda item: _cosine(vector, item[1]), default=None,
                 )
                 if match and _cosine(vector, match[1]) >= 0.67:
@@ -255,19 +443,25 @@ def classify(sessions, path, encoder=None):
                 unassigned.append((key, vector))
 
         if unassigned:
+            used_names = {
+                re.sub(r"[^\w]+", " ", topic["name"].casefold()).strip()
+                for topic in catalog["topics"]
+            }
             matrix = np.asarray([vector for _, vector in unassigned], dtype=np.float32)
             if matrix.ndim != 2:
                 raise ValueError("embedding model returned invalid vectors")
             norms = np.linalg.norm(matrix, axis=1)
             matrix = matrix / np.where(norms == 0, 1, norms)[:, None]
             similarity = matrix @ matrix.T
+            anchors = [_anchor_tokens(pending[key]) for key, _ in unassigned]
             remaining = list(range(len(unassigned)))
             while remaining:
                 seed = remaining.pop(0)
                 group = [seed]
                 rest = []
                 for index in remaining:
-                    if all(similarity[index, member] >= 0.75 for member in group):
+                    if all(similarity[index, member] >= 0.75
+                           and anchors[index] & anchors[member] for member in group):
                         group.append(index)
                     else:
                         rest.append(index)
@@ -278,7 +472,7 @@ def classify(sessions, path, encoder=None):
                 texts = [pending[unassigned[index][0]] for index in group]
                 topic_id = uuid.uuid4().hex
                 catalog["topics"].append({
-                    "id": topic_id, "name": _label(texts),
+                    "id": topic_id, "name": _unique_auto_name(texts, used_names),
                     "examples": [texts[0]], "keywords": [], "kind": "auto",
                 })
                 for index in group:
@@ -291,3 +485,42 @@ def classify(sessions, path, encoder=None):
             catalog["assignments"][key] = topic_id
     save_catalog(path, catalog)
     return assignments, catalog
+
+
+def classify(sessions, path, encoder=None):
+    with catalog_lock(path):
+        return _classify_locked(sessions, path, encoder=encoder)
+
+
+def _additional_subject_session_id(session_id, index, label):
+    return f"{session_id}\0subject\0{index}\0{label.strip().casefold()}"
+
+
+def classify_tagged(sessions, path, encoder=None):
+    """Assign one primary subject for cost totals and up to two additional subjects."""
+    sessions = list(sessions)
+    expanded = []
+    for user, session_id, primary, additional in sessions:
+        expanded.append((user, session_id, primary))
+        for index, label in enumerate(additional):
+            expanded.append((user, _additional_subject_session_id(session_id, index, label), label))
+    assignments, catalog = classify(expanded, path, encoder=encoder)
+    primary_assignments = {}
+    subject_tags = {}
+    for user, session_id, _, additional in sessions:
+        key = session_key(str(user), session_id)
+        primary = assignments.get(key, OTHER)
+        primary_assignments[key] = primary
+        extra = catalog.get("tag_overrides", {}).get(key)
+        if extra is None:
+            extra = [
+                assignments.get(
+                    session_key(str(user), _additional_subject_session_id(session_id, index, label)),
+                    OTHER,
+                )
+                for index, label in enumerate(additional)
+            ]
+        subject_tags[key] = list(dict.fromkeys(
+            topic_id for topic_id in [primary, *extra] if topic_id != OTHER
+        ))
+    return primary_assignments, subject_tags, catalog

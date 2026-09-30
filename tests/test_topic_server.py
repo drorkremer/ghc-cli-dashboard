@@ -97,3 +97,43 @@ def test_localhost_editor_rejects_invalid_topic_save(server):
         }, instance.topic_token, origin)
     assert exc.value.code == 400
     assert topic_classifier.load_catalog(catalog_path)["overrides"] == {}
+
+
+def test_localhost_editor_persists_subject_and_deliverable_overrides(server):
+    instance, _, catalog_path = server
+    origin = f"http://127.0.0.1:{instance.server_port}"
+    with request(instance, "POST", "/api/topics", {
+        "action": "create", "name": "Passkeys",
+    }, instance.topic_token, origin) as response:
+        topic_id = json.load(response)["topics"][0]["id"]
+    key = topic_classifier.session_key("u", "s")
+    with request(instance, "POST", "/api/topics", {
+        "action": "override_tags", "user": "u", "session_id": "s", "topic_ids": [topic_id],
+    }, instance.topic_token, origin):
+        pass
+    with request(instance, "POST", "/api/topics", {
+        "action": "override_deliverables", "user": "u", "session_id": "s",
+        "deliverables": ["deck", "doc"],
+    }, instance.topic_token, origin):
+        pass
+    catalog = topic_classifier.load_catalog(catalog_path)
+    assert catalog["tag_overrides"][key] == [topic_id]
+    assert catalog["deliverable_overrides"][key] == ["deck", "doc"]
+
+
+def test_localhost_editor_persists_family_correction(server):
+    instance, _, catalog_path = server
+    origin = f"http://127.0.0.1:{instance.server_port}"
+    with request(instance, "POST", "/api/topics", {
+        "action": "create", "name": "Worktree",
+    }, instance.topic_token, origin) as response:
+        topic_id = json.load(response)["topics"][0]["id"]
+    with request(instance, "POST", "/api/topics", {
+        "action": "create_family", "name": "Developer tooling",
+    }, instance.topic_token, origin) as response:
+        family_id = json.load(response)["families"][0]["id"]
+    with request(instance, "POST", "/api/topics", {
+        "action": "assign_family", "topic_id": topic_id, "family_id": family_id,
+    }, instance.topic_token, origin):
+        pass
+    assert topic_classifier.load_catalog(catalog_path)["family_overrides"][topic_id] == family_id

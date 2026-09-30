@@ -4,10 +4,11 @@
 import hmac
 import json
 import secrets
+import sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from topic_classifier import apply_edit, load_catalog, save_catalog
+from topic_classifier import apply_edit, catalog_lock, load_catalog, save_catalog
 
 
 def make_server(html_path, topic_path):
@@ -76,13 +77,14 @@ def make_server(html_path, topic_path):
                 edit = json.loads(self.rfile.read(size))
                 if not isinstance(edit, dict):
                     raise ValueError("topic edit must be an object")
-                catalog = load_catalog(topic_path)
-                apply_edit(catalog, edit)
-                save_catalog(topic_path, catalog)
+                with catalog_lock(topic_path):
+                    catalog = load_catalog(topic_path)
+                    apply_edit(catalog, edit)
+                    save_catalog(topic_path, catalog)
             except (ValueError, UnicodeDecodeError) as exc:
                 self._json(400, {"error": str(exc)})
                 return
-            except OSError as exc:
+            except (OSError, sqlite3.Error) as exc:
                 self._json(500, {"error": f"could not save topic file: {exc}"})
                 return
             self._json(200, catalog)
