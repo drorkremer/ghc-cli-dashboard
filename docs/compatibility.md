@@ -32,11 +32,20 @@ Optional first-turn summarization uses `gpt4all>=2.8.2,<3` and an explicitly
 downloaded local Qwen2.5 GGUF. GPT4All publishes a macOS universal2 wheel
 and a Windows x64 wheel, and the summarizer uses only cross-platform Python
 standard-library paths, SQLite, and CSV processing. Local inference was
-exercised on macOS, including a CPU-only run; **Windows execution has not
+exercised on macOS, including a CPU-only run and two spawned parallel model
+workers; **Windows execution has not
 yet been validated**. The optional SLM requires roughly a 1.1 GB model
 download and enough memory for its 8K-token context. Windows ARM64 is not
 covered by the published Windows x64 wheel. Without the SLM option, the
 ordinary extractor and dashboard remain unchanged.
+
+Alternatively, opt-in multi-topic summarization can use a separately
+installed local Ollama service via `127.0.0.1:11434`. This backend uses only
+Python's standard-library HTTP client, shares one installed model across
+concurrent requests, and does not require GPT4All. For example,
+`gpt-oss:20b` uses roughly 12 GB of model weights plus runtime/context
+memory; the tool does not install or download it automatically.
+**This Ollama pipeline has been exercised on macOS, not native Windows.**
 
 ## Export format
 

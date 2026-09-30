@@ -77,8 +77,11 @@ topic-enabled dashboard without reviewing its contents.
 
 The local embedding model (`BAAI/bge-small-en-v1.5` through FastEmbed/ONNX)
 is downloaded on first use (approximately 67 MB), with no paid service.
-Only compact task summaries (or optional SLM-generated topic summaries) are
-embedded. Assignment order is:
+Only compact task summaries (or optional SLM-generated subjects) are
+embedded. A multi-topic export carries one primary subject, up to two
+additional subjects, and any applicable independent deliverable labels
+(`code`, `deck`, `doc`, `info`, `data`, `config`, or `other`) per session.
+Assignment order is:
 
 1. An explicit per-session correction in the catalog.
 2. The saved automatic assignment from a previous build.
@@ -88,14 +91,31 @@ embedded. Assignment order is:
 5. Groups of at least two unmatched summaries at similarity 0.75 or higher
    become a discovered topic; unmatched singletons remain **Other**.
 
-Discovered topics get stable IDs and names based on a shared summary word
-or representative summary. They are approximate, not LLM-generated.
+Discovered topics get stable IDs and names based on shared summary terms
+or a representative summary. If separate groups would have the same short
+name, the latter receives a more specific representative label rather than
+silently merging potentially different subjects. Existing saved names remain
+stable; use a fresh catalog to relabel earlier duplicate-name discoveries.
+Topic names are approximate; when the optional
+SLM runs, it summarizes sessions but does not name the discovered groups.
 In editable mode, create a topic with a name and optional example, edit
 example summaries and exact-phrase rules, rename or merge topics, or change
-a session's selection. Changes to a session are visible immediately and
+a session's primary/additional subjects and deliverables. Changes to a
+session are visible immediately and
 override future automatic builds; new matching rules are applied to
-unassigned sessions on the *next* dashboard build. The topic
-filter combines with existing project, model, provider, and date filters.
+unassigned sessions on the *next* dashboard build. Family, topic, and
+deliverable selectors each support multiple choices (OR within each
+selector, AND between selectors), counting each matching session once.
+Family choices narrow to the selected topics, topic choices narrow to the
+selected families, and deliverable choices reflect both. All three respect
+project, model, provider, and date/graph-zoom filters. Invalidated selections
+are cleared with a visible notice. Date controls select one time window,
+not multiple independent ranges. The topic chart attributes
+each session's usage/cost to its **primary** subject only; extra subjects
+are available for discovery and filters, without double-counting chart
+totals. Filtering by an extra subject shows the full filtered cost for
+matching sessions, not a split estimate. Clicking a primary-topic chart
+entry drills into primary-only sessions so its cost reconciles to the chart.
 Session counts use distinct session IDs, while token/cost sums keep the
 existing dashboard definitions. Rows from legacy CSVs without session IDs
 remain in **Other** and do not contribute to the distinct-session count.
@@ -113,10 +133,20 @@ service receives your usage data. Only model weights are downloaded.
 ### Optional offline SLM summaries
 
 If stored task summaries are generic, a separate, **opt-in** offline step
-can summarize the first user turn. Install both optional requirements files:
+can summarize the first user turn. For the GGUF backend, install both
+optional requirements files:
 
 ```powershell
 python -m pip install -r requirements-topics.txt -r requirements-summaries.txt
+```
+
+The examples below use a named export from the same session stores that
+the summarizer will read. Extract it first, using the same database order:
+
+```powershell
+python extract_usage.py --out usage.csv `
+  --db "C:\first\.copilot\session-store.db" `
+  --db "D:\other\.copilot\session-store.db"
 ```
 
 Download `qwen2.5-1.5b-instruct-q4_k_m.gguf` (about 1.1 GB) from the
@@ -146,18 +176,121 @@ limit to finish the full dataset. The cache is keyed by user/session, the select
 file's metadata, and the input text; generated summaries are saved after
 each session so an interrupted run can resume. No raw user turn is written
 to the enriched CSV or cache. Both files may still contain sensitive
-topic names and session IDs; keep them private. First turns are read from
+topic names and session IDs; keep them private. A topic-enabled HTML build
+also displays the local summary in Task Detail and the session-correction
+table so you can review assignments; treat that HTML as private too.
+First turns are read from
 read-only SQLite snapshots. Shared launcher lines are removed within
 each store only when they occur in at least half of 20 or more first
 messages; longer remaining text is summarized in bounded pieces and
 combined. These are heuristics: inspect the results and use the
 dashboard's manual corrections as needed.
 
+The default is sequential inference. `--workers N` runs up to N independent
+session summaries in parallel using spawned local processes on macOS and
+Windows. Each worker loads its own copy of the GGUF model and context,
+so start with `--workers 2` only if you have enough memory; more workers
+may increase memory pressure or even reduce throughput. The parent process
+alone writes the cache atomically as results arrive. A cross-platform
+SQLite lock (`<cache>.lock.sqlite3`) rejects a second summarizer command
+using the same cache rather than risking lost updates; the OS releases the
+lock if the first process exits unexpectedly.
+
 Use a **new** `--topics-file` for the SLM-enriched export if the same
 sessions were already classified from the old generic summaries: saved
 automatic topic assignments intentionally retain their IDs until you
 correct or merge them. The original CSV and existing cost calculations
 are unchanged.
+
+### Multi-topic and deliverable extraction
+
+Use `--multi-topic` to extract a specific primary subject, zero to two
+additional subjects, and applicable deliverable types per session. It
+reads the **whole first user turn**, then a reproducible random sample of
+up to five later user turns (at most 1,600 characters each). This limits
+additional text to 8,000 characters while preserving the full first
+message; long inputs are summarized in chunks. The sampled evidence and
+local model/prompt are part of the cache key, so changed evidence triggers
+regeneration. Raw turns remain in the local session stores, never in the
+enriched CSV or cache. Use a **separate cache and topic catalog** from the
+older single-topic pipeline:
+
+```powershell
+python topic_summarizer.py --multi-topic --workers 4 `
+  --in usage.csv --out usage-multi.csv `
+  --cache topic-multi-cache.json `
+  --db "C:\first\.copilot\session-store.db" `
+  --db "D:\other\.copilot\session-store.db" `
+  --model "C:\Models\qwen2.5-1.5b-instruct-q4_k_m.gguf"
+python dashboard.py --in usage-multi.csv --topics-file topics-multi.json
+```
+
+If a smaller GGUF model produces unreliable labels, an installed **local**
+Ollama model can provide schema-constrained multi-topic output instead.
+Install Ollama separately, run `ollama pull gpt-oss:20b` explicitly
+(approximately 12 GB of model weights), and leave its local service running.
+Install `requirements-topics.txt` for dashboard clustering; this Ollama
+backend does not need `requirements-summaries.txt`:
+
+```powershell
+python topic_summarizer.py --multi-topic --ollama-model gpt-oss:20b `
+  --workers 4 --in usage.csv --out usage-multi.csv `
+  --cache topic-ollama-cache.json `
+  --db "C:\first\.copilot\session-store.db" `
+  --db "D:\other\.copilot\session-store.db"
+```
+
+Use either `--ollama-model` **or** `--model`, never both. Ollama must already
+be running and the named model must be installed. The summarizer connects
+only to `127.0.0.1:11434`; it does not call a hosted inference endpoint.
+With Ollama, workers are concurrent requests sharing its loaded model,
+not separate GGUF processes. Choose a separate cache when switching models;
+the installed model digest is part of each cache entry's identity.
+Neither the SLM pass nor its prerequisites are started or installed
+automatically by `dashboard.py`. Run the summarizer after exporting usage
+and before building a topic-enabled dashboard; rerun it to enrich newly
+recorded sessions from the durable cache.
+
+### Optional topic families
+
+Once the topic-enabled dashboard has created a catalog, group its **existing
+topic IDs** into broader subject families using the same locally installed
+Ollama model:
+
+```powershell
+python dashboard.py --in usage-multi.csv --topics-file topics-multi.json
+python topic_families.py --catalog topics-multi.json --ollama-model gpt-oss:20b
+python dashboard.py --in usage-multi.csv --topics-file topics-multi.json --serve
+```
+
+Family classification is a separate opt-in pass; opening or refreshing the
+dashboard never invokes the model. It uses topic names and short examples,
+not raw session turns. Work is saved after each validated batch. Rerunning
+classifies only newly discovered topics; `--refresh` reclassifies automatic
+assignments without replacing manual edits, and `--limit 24` makes a smaller
+trial. Rebuild the dashboard after classification to embed the updated
+families in its static HTML. The separate family filter narrows topic
+choices; selecting topics narrows family choices in turn. Both allow multiple
+selections, as does the deliverable selector. A family matches a primary or
+additional subject without double-counting cost. In localhost editable
+mode, create and rename families or reassign a
+topic to any family or Uncategorized. Assignments persist in the private
+catalog; topic IDs and costs are never merged.
+
+The multi-topic CSV adds `topic_subjects` and `topic_deliverables` JSON
+arrays. Its `topic_summary` still carries the primary subject for older
+views. `topic_status` is `classified`, `review`, `error`, `missing_turn`,
+or `unclassified`; `topic_review` lists issues such as uncertain
+deliverable types or repaired model output. Invalid model responses are
+reported per session and retried on the next run rather than aborting the
+batch; review errors before using the dashboard for topic analysis. An
+oversized list of model-suggested deliverables is normalized to the
+supported types, with unrecognized labels flagged for review. A partial
+`--limit` run has empty arrays for unprocessed sessions; do not interpret
+it as full topic coverage. Sessions without a classified subject remain
+in Other instead of inheriting a generic task-summary topic. Localhost
+edits save primary, additional subject, and deliverable overrides to the
+catalog.
 
 `extract_usage.py` accepts multiple `--db` arguments. Without one, it reads
 `~/.copilot/session-store.db`; explicit arguments replace that default.
@@ -194,6 +327,22 @@ Reloading preserves the collapse choice, and resetting filters does not
 reveal the panel. On small screens, the panel starts collapsed and expands
 inline below the controls.
 
+The standalone HTML's **Session explorer** uses the same project, model,
+provider, topic (when enabled), and date selection as every chart. Click an
+individual session for its filtered day/model/effort rows, calls, token
+categories, cost coverage, and estimated cost. A model or time-window filter
+can therefore show only part of a session; the explorer and its detail use
+that partial cost, not its all-time total. Click project, model, provider,
+topic, trend, user, effort, or work-pattern chart entries to open the
+corresponding session group. Grouping also supports day, week, month, and
+task theme; search and **Show more sessions** browse large exports without
+rendering every row at once. Legacy rows without a session ID are shown
+individually as "ID unavailable" rather than merged into a fictitious
+session. The top **Sessions** card counts distinct `(user, session_id)` pairs
+within the current global filters; its note discloses any rows without IDs,
+which cannot safely contribute to a distinct-session count. Per-prompt data
+is not included in this dashboard.
+
 For demos, collapse the sidebar before presenting. This hides the filter list
 only: project names remain in charts and task detail, and all source rows are
 still embedded in the HTML. Use build-time redaction for a shareable artefact
@@ -202,6 +351,15 @@ that must not contain those projects.
 Date presets are relative to the latest date in the loaded exports, not the
 current date. The header shows **Data through** separately from the generation
 time. The latest day, week or month can be incomplete.
+
+The **Usage over time** chart has independent day/week/month grouping and
+**Period / Cumulative** controls. Cumulative sums only usage passing the
+current project, model, provider, topic, and date filters; it starts at zero
+at the selected range's beginning (or the first matching date for **All**).
+Empty days, weeks, or months appear as flat intervals. The hover shows both
+the period amount and running total in the active tokens/cost unit. The
+period-based insight beneath the chart does not change when toggling the
+series. The mode is remembered in this browser for each dashboard.
 
 Provider labels are inferred from model-name prefixes:
 

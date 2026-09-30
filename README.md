@@ -41,11 +41,24 @@ out, and review the privacy implications before sharing a CSV or dashboard.
 - Trends by day, week, or month.
 - Input, output, cache, and reasoning token categories.
 - Model mix, provider mix, reasoning effort, and task detail.
-- Optional local topic discovery and per-session topic corrections, with
+- Optional local subject discovery (one primary plus additional subjects),
+  independent deliverable labels, and per-session corrections, with
   usage and existing cost totals by topic.
 
 The dashboard estimates cost from usage data recorded by Copilot CLI. It does
 not represent an invoice.
+
+### What's new in this revision
+
+- Filter-aware **Session explorer** with per-session usage, cost, and cost
+  coverage, plus a distinct-session headline metric.
+- **Period / Cumulative** usage trends for tokens or estimated cost; chart
+  zoom filters the entire dashboard, not just the chart.
+- Optional local multi-topic classification: a primary subject, up to two
+  additional subjects, and independent deliverable types per session.
+- Editable topic **families** and multi-select family, topic, and deliverable
+  filters. Choices narrow one another as dates and other filters change.
+  Session cost remains attributed to its primary subject only.
 
 ### Optional topics
 
@@ -53,9 +66,10 @@ Install the optional, local embedding model support:
 
 ```powershell
 python -m pip install -r requirements-topics.txt
-python extract_usage.py --db "C:\first\.copilot\session-store.db" `
+python extract_usage.py --out usage.csv `
+  --db "C:\first\.copilot\session-store.db" `
   --db "D:\other\.copilot\session-store.db"
-python dashboard.py --in "copilot_usage_*.csv" --topics --serve
+python dashboard.py --in usage.csv --topics --serve
 ```
 
 Open the localhost URL printed by `dashboard.py`. The **Topics** section
@@ -70,23 +84,70 @@ summaries locally. No session text is sent to a classification service, and
 nothing runs in the Copilot request path. Automatic labels are suggestions.
 See [topic classification and source selection](docs/advanced-usage.md#topic-classification).
 
-If Copilot's stored task summaries are generic or repeated, an **optional
-offline SLM step** can summarize the first user turn into a better
-classification input. Install `requirements-summaries.txt`, download a
-[Qwen2.5-1.5B-Instruct Q4_K_M GGUF](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF),
-and run `topic_summarizer.py --in usage.csv --out usage-with-topics.csv
---db PATH_TO_SESSION_STORE --model PATH_TO_GGUF`. Then build the dashboard
-from `usage-with-topics.csv` with `--topics`. The raw user messages stay in
-the local Copilot stores; the enriched CSV contains only short generated
-summaries, and a private cache makes subsequent runs incremental. See the
+### Multi-topic and family workflow (opt-in)
+
+For richer subjects when stored task summaries are generic, install
+`requirements-topics.txt` as above. Install [Ollama](https://ollama.com/)
+separately, start its local service, and explicitly run
+`ollama pull gpt-oss:20b` (about 12 GB of model weights). Then, from this
+repository in PowerShell, run:
+
+```powershell
+python extract_usage.py --out usage.csv
+python topic_summarizer.py --in usage.csv --out usage-multi.csv `
+  --db "$HOME/.copilot/session-store.db" `
+  --multi-topic --ollama-model gpt-oss:20b --workers 4 `
+  --cache topic-ollama-cache.json
+python dashboard.py --in usage-multi.csv --topics-file topics-multi.json `
+  --out usage_dashboard.html
+python topic_families.py --catalog topics-multi.json --ollama-model gpt-oss:20b
+python dashboard.py --in usage-multi.csv --topics-file topics-multi.json `
+  --out usage_dashboard.html --serve
+```
+
+Open the localhost URL printed by the final command to edit topics, families,
+and session assignments; omit `--serve` for a read-only HTML file. If you use
+more than one Copilot home, add the same `--db PATH` arguments to **both**
+extraction and summarization, in the same order. The first database wins if
+session IDs overlap. The CSV's `topic_status` and `topic_review` columns
+identify uncertain or failed classifications to review. Rerun the summarizer
+to process new sessions from its private cache, then rebuild the dashboard;
+rerun the family pass to classify newly discovered topics. Family assignments
+never merge topics or costs.
+
+Neither model installation nor multi-topic or family classification happens
+automatically when someone opens the dashboard. For a smaller, explicitly
+downloaded GGUF model instead of Ollama, install
+`requirements-summaries.txt` and see the
 [offline SLM instructions](docs/advanced-usage.md#optional-offline-slm-summaries).
+The Ollama pipeline and editor have been exercised on macOS; native Windows
+inference has not yet been verified.
 
 ### Exploring your usage
 
-The overview puts date and metric controls above three headline metrics and
+The overview puts date and metric controls above four headline metrics
+(tokens, estimated cost, model calls, and distinct identified sessions) and
 the usage trend. Cost coverage is attached to the cost card, with incomplete
 coverage expanded automatically. Expand the token card for its exact total
 and definition.
+
+In **Usage over time**, choose **Period** for per-day/week/month totals or
+**Cumulative** for a running total within the selected date range. Empty
+periods stay flat; the hover shows both the period amount and running total.
+The same switch works for tokens and estimated cost.
+Dragging to zoom on the usage trend sets a custom date range for the
+entire dashboard, including family/topic/deliverable choices and session totals.
+Double-click the trend or choose **All time** to clear the zoom.
+
+The **Session explorer** lists individual sessions and their estimated costs
+within the current filters. Click a session to inspect its model/day usage, or
+click a project, model, topic, provider, or time-period chart entry to narrow
+the list. Use its grouping and search controls for other breakdowns. It is
+available in the standalone HTML; prompt-level detail is not exported.
+Select multiple topics, families, or deliverables to match **any** choice
+within that filter; different filter groups combine together. Selecting
+topics also narrows the available families, and selecting a family narrows
+the available topics. The time control selects one window at a time.
 
 Search projects or models in the filter panel, use **Only** to select one
 item in a group, or **Show more** to browse beyond the first eight items.
@@ -115,7 +176,7 @@ No real usage data is shown.
 
 Headline numbers, usage trend, top projects, and model and provider mix:
 
-![Overview with three headline cards, a usage trend, project and model rankings, and provider mix](docs/images/overview.png)
+![Overview with headline cards, a usage trend, project and model rankings, and provider mix](docs/images/overview.png)
 
 Usage over time, with daily, weekly, and monthly grouping:
 
@@ -143,7 +204,11 @@ python dashboard.py --in "copilot_usage_*.csv" --out shared_dashboard.html `
   --omit-task-summaries
 ```
 
-The `.gitignore` excludes generated CSV and HTML files. Do not commit them.
+The `.gitignore` excludes documented generated CSV, HTML, catalog, and cache
+files. Topic-enabled HTML also contains generated session summaries, and the
+topic catalog contains session IDs and example labels. Keep these outputs
+private; do not commit or share them without reviewing and redacting the
+underlying data.
 See [Advanced usage](docs/advanced-usage.md) for sharing, redaction, and
 combining multiple exports.
 
